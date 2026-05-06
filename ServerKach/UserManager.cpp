@@ -7,6 +7,7 @@
 #include <QJsonObject>
 #include <QRandomGenerator>
 #include <QSqlError>
+#include <QCryptographicHash>
 
 // ⚠️ ТЕСТОВЫЙ РЕЖИМ: раскомментируй строку ниже для тестирования
 // Тест: неделя = 2 мин, 2 месяца плана = 16 мин
@@ -70,7 +71,35 @@ void UserManager::initializeTables()
         "Save_Training_Cable_Fly_P1",
         "Save_Training_Leg_Extension_P1",
         "Save_Training_Plank_P1",
-        "Save_Training_Chest_Fly_P1"
+        "Save_Training_Chest_Fly_P1",
+        // Plan 2 - новые упражнения
+        "Save_Training_Hip_Abduction_Lean_P2",
+        "Save_Training_Pushup_P2",
+        "Save_Training_Hip_Abduction_90_P2",
+        "Save_Training_Pullup_P2",
+        "Save_Training_Leg_Extension_Frog_P2",
+        // Plan 3 — 9 новых упражнений
+        "Save_Training_Crane_P3",
+        "Save_Training_Shoulder_Side_Raise_Sit_P3",
+        "Save_Training_Goodmorning_Hack_P3",
+        "Save_Training_Shoulder_Raise_One_Hand_Bench_P3",
+        "Save_Training_Froggy_Stand_P3",
+        "Save_Training_Hack_Squat_P3",
+        "Save_Training_Pullover_P3",
+        "Save_Training_Crossover_Diagonal_Kick_P3",
+        "Save_Training_Wall_Abduction_One_P3",
+        // Plan 4 — 6 новых упражнений
+        "Save_Training_Cable_Kickback_P4",
+        "Save_Training_Crossover_Step_Up_P4",
+        "Save_Training_Dips_P4",
+        "Save_Training_Cable_Stork_P4",
+        "Save_Training_Glute_Bridge_Single_Leg_P4",
+        "Save_Training_Cable_Rotation_P4",
+        // Plan 7 — 4 новых упражнения
+        "Save_Training_Negative_Pullup_P7",
+        "Save_Training_Barbell_Bicep_Curl_P7",
+        "Save_Training_Leg_Raise_Elbow_P7",
+        "Save_Training_Brachialis_Curl_P7"
     };
 
     for (const QString &table : tables) {
@@ -164,6 +193,21 @@ void UserManager::initializeTables()
         qWarning() << "Failed to create Recipe_Steps:" << sq.lastError().text();
     } else {
         qDebug() << "Table ready: Recipe_Steps";
+    }
+
+    // ✅ Таблица геймификации
+    QSqlQuery gamifQ(db);
+    if (!gamifQ.exec(
+            "CREATE TABLE IF NOT EXISTS Gamification ("
+            "id         INTEGER PRIMARY KEY CHECK(id=1), "
+            "start_date TEXT    NOT NULL DEFAULT (date('now')), "
+            "total_days INTEGER NOT NULL DEFAULT 90)")) {
+        qWarning() << "Failed to create Gamification:" << gamifQ.lastError().text();
+    } else {
+        qDebug() << "Table ready: Gamification";
+        // Вставить запись-одиночку если её нет
+        QSqlQuery initG(db);
+        initG.exec("INSERT OR IGNORE INTO Gamification (id, start_date, total_days) VALUES (1, date('now'), 90)");
     }
 
     // ✅ Заполнить начальные рецепты (только если таблица пустая)
@@ -331,6 +375,130 @@ void UserManager::initializeTables()
             qDebug() << "Table ready: Friends";
         }
     }
+
+    // ── Миграция: колонка kachballs в USERS ────────────────────────────────
+    {
+        QSqlQuery mig(db);
+        mig.exec("ALTER TABLE USERS ADD COLUMN kachballs INTEGER DEFAULT 0");
+        // Ошибка = колонка уже есть, это нормально
+    }
+
+    // ── Каталог достижений ─────────────────────────────────────────────────
+    {
+        QSqlQuery aq(db);
+        if (!aq.exec(
+                "CREATE TABLE IF NOT EXISTS Achievements ("
+                "  id          INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "  key         TEXT    NOT NULL UNIQUE, "
+                "  name        TEXT    NOT NULL, "
+                "  description TEXT    NOT NULL DEFAULT '', "
+                "  category    TEXT    NOT NULL DEFAULT 'training', "
+                "  reward      INTEGER NOT NULL DEFAULT 10, "
+                "  threshold   INTEGER NOT NULL DEFAULT 1)")) {
+            qWarning() << "Failed to create Achievements:" << aq.lastError().text();
+        } else {
+            qDebug() << "Table ready: Achievements";
+        }
+    }
+
+    // ── Полученные достижения пользователей ────────────────────────────────
+    {
+        QSqlQuery uaq(db);
+        if (!uaq.exec(
+                "CREATE TABLE IF NOT EXISTS User_Achievements ("
+                "  id             INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "  user_id        INTEGER NOT NULL, "
+                "  achievement_id INTEGER NOT NULL, "
+                "  earned_at      TEXT    NOT NULL DEFAULT (datetime('now')), "
+                "  FOREIGN KEY(user_id)        REFERENCES USERS(user_id), "
+                "  FOREIGN KEY(achievement_id) REFERENCES Achievements(id), "
+                "  UNIQUE(user_id, achievement_id))")) {
+            qWarning() << "Failed to create User_Achievements:" << uaq.lastError().text();
+        } else {
+            qDebug() << "Table ready: User_Achievements";
+        }
+    }
+
+    // ── Заполнить каталог достижений (один раз) ────────────────────────────
+    seedAchievements();
+
+    // ── Еженедельные миссии ─────────────────────────────────────────────────
+    {
+        QSqlQuery wm(db);
+        wm.exec(
+            "CREATE TABLE IF NOT EXISTS Weekly_Missions ("
+            "  user_id            INTEGER NOT NULL, "
+            "  year               INTEGER NOT NULL, "
+            "  week_num           INTEGER NOT NULL, "
+            "  steps_done         INTEGER NOT NULL DEFAULT 0, "
+            "  workouts_done      INTEGER NOT NULL DEFAULT 0, "
+            "  nutrition_done     INTEGER NOT NULL DEFAULT 0, "
+            "  steps_rewarded     INTEGER NOT NULL DEFAULT 0, "
+            "  workouts_rewarded  INTEGER NOT NULL DEFAULT 0, "
+            "  nutrition_rewarded INTEGER NOT NULL DEFAULT 0, "
+            "  full_bonus_rewarded INTEGER NOT NULL DEFAULT 0, "
+            "  PRIMARY KEY (user_id, year, week_num)"
+            ")");
+        if (wm.lastError().isValid())
+            qWarning() << "Failed to create Weekly_Missions:" << wm.lastError().text();
+        else
+            qDebug() << "Table ready: Weekly_Missions";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Заполнение каталога достижений
+// ---------------------------------------------------------------------------
+void UserManager::seedAchievements()
+{
+    QSqlQuery countQ(db);
+    if (!countQ.exec("SELECT COUNT(*) FROM Achievements")) return;
+    if (countQ.next() && countQ.value(0).toInt() > 0) {
+        qDebug() << "Achievements already seeded, skipping.";
+        return;
+    }
+
+    // { key, name, description, category, reward, threshold }
+    struct AchDef { QString key; QString name; QString desc; QString cat; int reward; int threshold; };
+    QVector<AchDef> defs = {
+        // ── Тренировочные ──
+        {"first_workout",      "Первый шаг",            "Завершите первую тренировку",                  "training", 10,  1},
+        {"workouts_10",        "Новичок",               "Завершите 10 тренировок",                      "training", 25,  10},
+        {"workouts_50",        "Опытный атлет",         "Завершите 50 тренировок",                      "training", 50,  50},
+        {"workouts_100",       "Железная воля",         "Завершите 100 тренировок",                     "training", 100, 100},
+        {"week_complete",      "Неделя выполнена",      "Выполните все 3 тренировки за неделю",          "training", 20,  1},
+        {"plan_complete",      "План завершён",         "Полностью завершите тренировочный план",        "training", 75,  1},
+        {"weeks_4",            "Месяц дисциплины",      "Завершите 4 недели тренировок",                 "training", 40,  4},
+
+        // ── Социальные ──
+        {"first_friend",       "Первый друг",           "Добавьте первого друга",                       "social",   10,  1},
+        {"friends_5",          "Компания",              "Добавьте 5 друзей",                            "social",   25,  5},
+        {"friends_10",         "Популярный",            "Добавьте 10 друзей",                           "social",   50,  10},
+        {"first_review",       "Критик",                "Оставьте первый отзыв на рецепт",             "social",   10,  1},
+        {"reviews_5",          "Гурман-критик",         "Оставьте 5 отзывов на рецепты",               "social",   25,  5},
+
+        // ── Замеры и питание ──
+        {"first_measurement",  "Первый замер",          "Сделайте первый замер тела",                   "body",     10,  1},
+        {"measurements_10",    "Аналитик тела",         "Сделайте 10 замеров",                          "body",     30,  10},
+        {"nutrition_7_days",   "Неделя питания",        "Заполняйте рацион 7 дней подряд",              "nutrition",30,  7},
+        {"nutrition_30_days",  "Месяц питания",         "Заполняйте рацион 30 дней подряд",             "nutrition",75,  30},
+        {"first_nutrition",    "Первый рацион",         "Заполните рацион впервые",                     "nutrition",10,  1},
+    };
+
+    for (const auto& a : defs) {
+        QSqlQuery ins(db);
+        ins.prepare("INSERT OR IGNORE INTO Achievements (key, name, description, category, reward, threshold) "
+                    "VALUES (:key, :name, :desc, :cat, :reward, :thr)");
+        ins.bindValue(":key",    a.key);
+        ins.bindValue(":name",   a.name);
+        ins.bindValue(":desc",   a.desc);
+        ins.bindValue(":cat",    a.cat);
+        ins.bindValue(":reward", a.reward);
+        ins.bindValue(":thr",    a.threshold);
+        if (!ins.exec())
+            qWarning() << "Failed to seed achievement" << a.key << ":" << ins.lastError().text();
+    }
+    qDebug() << "Achievements seeded:" << defs.size() << "entries";
 }
 
 // ---------------------------------------------------------------------------
@@ -651,11 +819,24 @@ bool UserManager::addRecipe(const QString &name,
     return true;
 }
 
+//Хэширование пароля (SHA-256 + соль)
+void UserManager::hashPassword(QString &password)
+{
+    static const QByteArray salt = QByteArrayLiteral("KachFitness_v1_salt");
+    QByteArray data = salt + password.toUtf8();
+    QByteArray hash = QCryptographicHash::hash(data, QCryptographicHash::Sha256);
+    password = QString::fromLatin1(hash.toHex());
+}
+
 //Функция регистрации пользователся
 bool UserManager::registerUser(const QString &firstName, const QString &lastName, const QString &email, const QString &passwordHash, const QString &gender, const QString &birthDate, double height, double weight, QString &errorMessage, int& userId)
 {
     //ОбЪект типа запроса
     QSqlQuery query(db);
+
+    //Хэшируем пароль перед сохранением
+    QString hashed = passwordHash;
+    hashPassword(hashed);
 
     //Запрос на вставку данных
     query.prepare(
@@ -667,7 +848,7 @@ bool UserManager::registerUser(const QString &firstName, const QString &lastName
     query.bindValue(":first_name", firstName);
     query.bindValue(":last_name", lastName);
     query.bindValue(":email", email);
-    query.bindValue(":password_hash", passwordHash);
+    query.bindValue(":password_hash", hashed);
     query.bindValue(":gender", gender);
     query.bindValue(":birth_date", birthDate);
     query.bindValue(":height", height);
@@ -717,23 +898,37 @@ bool UserManager::registerUser(const QString &firstName, const QString &lastName
 //Проверка учетных данных
 bool UserManager::authenticateUser(const QString &email, const QString &password, int& userId)
 {
-    //Объект типа запроса
     QSqlQuery query(db);
 
-    //Запрос на поиск данных
-    query.prepare("SELECT * FROM users WHERE email=:email AND password_hash=:password_hash");
-
-    //Привязываем значение email
+    // Получаем сохранённый пароль по email
+    query.prepare("SELECT user_id, password_hash FROM users WHERE email=:email");
     query.bindValue(":email", email);
 
-    //Привязываем значение password
-    query.bindValue(":password_hash", password);
+    if (!query.exec() || !query.next())
+        return false;
 
-    if (query.exec() && query.next())
-    {
-        //Получаем ID пользователя
-        userId = query.value(0).toInt();
+    const int foundId = query.value(0).toInt();
+    const QString stored = query.value(1).toString();
 
+    // Считаем хэш из введённого пароля
+    QString hashed = password;
+    hashPassword(hashed);
+
+    if (stored.compare(hashed, Qt::CaseInsensitive) == 0) {
+        userId = foundId;
+        return true;
+    }
+
+    // Поддержка старых аккаунтов (пароль был сохранён в открытом виде):
+    // если совпал — мигрируем в хэш.
+    if (stored == password) {
+        QSqlQuery upd(db);
+        upd.prepare("UPDATE users SET password_hash=:h WHERE user_id=:uid");
+        upd.bindValue(":h", hashed);
+        upd.bindValue(":uid", foundId);
+        if (!upd.exec())
+            qWarning() << "Не удалось мигрировать пароль в хэш:" << upd.lastError().text();
+        userId = foundId;
         return true;
     }
 
@@ -855,24 +1050,57 @@ bool UserManager::getImage(int user_id, QByteArray &imageData)
 
 bool UserManager::saveEPlanTrainningUserData(int user_id, int &EPlanTrainningUser)
 {
-    // Готовим SQL-запрос для выборки изображения
-    QSqlQuery query(db);
+    // Сначала узнаем текущий план, чтобы понять — это смена/очистка или нет
+    int oldPlan = -1;
+    {
+        QSqlQuery qCur(db);
+        qCur.prepare("SELECT PlanTrainning FROM users WHERE user_id=:user_id");
+        qCur.bindValue(":user_id", user_id);
+        if (qCur.exec() && qCur.next())
+            oldPlan = qCur.value(0).toInt();
+    }
 
+    QSqlQuery query(db);
     query.prepare("UPDATE users SET PlanTrainning=:PlanTrainning WHERE user_id=:user_id");
     query.bindValue(":user_id", user_id);
     query.bindValue(":PlanTrainning", EPlanTrainningUser);
 
-    // Выполнение запроса
-    if(query.exec())
-    {
-        qDebug() << "PlanTrainning for user" << user_id << "saved successfully.";
-        return true;
-    }
-    else
+    if(!query.exec())
     {
         qCritical() << "Error saving PlanTrainning:" << query.lastError().text();
         return false;
     }
+
+    qDebug() << "PlanTrainning for user" << user_id << "saved successfully. old=" << oldPlan
+             << "new=" << EPlanTrainningUser;
+
+    // Если план реально изменился (включая очистку в 0 и выбор нового после завершения) —
+    // полностью обнуляем статистику тренировок и прогресс недель: подходы, вес — всё в ноль,
+    // как будто пользователь начал с самого начала.
+    if (oldPlan != EPlanTrainningUser) {
+        // 1. Стираем недельную статистику (подходы, поднятый вес)
+        clearWorkoutStats(user_id);
+
+        // 2. Сбрасываем прогресс тренировочных недель
+        QSqlQuery qReset(db);
+        qReset.prepare("UPDATE Training_Week_Progress SET "
+                       "current_week = 1, "
+                       "workout1_done = 0, workout2_done = 0, workout3_done = 0, "
+                       "w1_date = '', w2_date = '', w3_date = '', "
+                       "week_start_date = '', "
+                       "week_completed = 0 "
+                       "WHERE user_id = :uid");
+        qReset.bindValue(":uid", user_id);
+        if (!qReset.exec()) {
+            qWarning() << "saveEPlanTrainningUserData: reset week progress error:"
+                       << qReset.lastError().text();
+        }
+
+        qDebug() << "✅ Stats & week progress wiped for user" << user_id
+                 << "(plan changed" << oldPlan << "->" << EPlanTrainningUser << ")";
+    }
+
+    return true;
 }
 
 bool UserManager::savePlanStartDate(int user_id, const QString &datetime)
@@ -2855,7 +3083,7 @@ bool UserManager::getAllUsers(QString &jsonData)
     }
 
     QSqlQuery q(db);
-    if (!q.exec("SELECT user_id, first_name, last_name, email, gender, birth_date, height, weight, Goal, StandardSubscription, PlanTrainning FROM USERS ORDER BY user_id")) {
+    if (!q.exec("SELECT user_id, first_name, last_name, email, gender, birth_date, height, weight, Goal, StandardSubscription, PlanTrainning, COALESCE(kachballs,0) FROM USERS ORDER BY user_id")) {
         qWarning() << "getAllUsers error:" << q.lastError().text();
         return false;
     }
@@ -2873,7 +3101,18 @@ bool UserManager::getAllUsers(QString &jsonData)
         obj["weight"]        = q.value(7).toDouble();
         obj["goal"]          = q.value(8).toString();
         obj["subscription"]  = q.value(9).toInt();
-        obj["planTrainning"] = q.value(10).toInt();
+        int planId = q.value(10).toInt();
+        obj["planTrainning"] = planId;
+        // Читаемое название плана
+        QString pn = "Нет плана";
+        if (planId == 1) pn = "Зал с нуля";
+        else if (planId == 2) pn = "Зал любитель";
+        else if (planId == 3) pn = "Песочные часы";
+        else if (planId == 4) pn = "Ягодицы без ног";
+        else if (planId == 5) pn = "Песочные часы PRO";
+        else if (planId == 7) pn = "Учимся подтягиваться";
+        obj["planName"]      = pn;
+        obj["kachballs"]     = q.value(11).toInt();
         arr.append(obj);
     }
 
@@ -2984,7 +3223,12 @@ bool UserManager::getUserWorkoutInfo(int user_id, QString &jsonData)
 
     // Название плана
     QString planName = "Нет плана";
-    if (planId == 1) planName = "Новичок для зала с нуля";
+    if (planId == 1) planName = "Тренажёрный зал с нуля";
+    else if (planId == 2) planName = "Тренажёрный зал любитель";
+    else if (planId == 3) planName = "Песочные часы";
+    else if (planId == 4) planName = "Ягодицы без ног";
+    else if (planId == 5) planName = "Песочные часы PRO";
+    else if (planId == 7) planName = "Учимся подтягиваться";
     obj["planName"] = planName;
 
     // Получаем прогресс из Training_Week_Progress
@@ -3389,7 +3633,8 @@ bool UserManager::getFriends(int userId, QString &jsonData)
         "SELECT u.user_id, u.first_name, u.last_name, "
         "CASE WHEN u.birth_date IS NULL OR u.birth_date = '' THEN 0 "
         "     ELSE CAST((julianday('now') - julianday(u.birth_date)) / 365.25 AS INTEGER) END AS age, "
-        "u.Goal, u.userFriendID, u.imageAvatar "
+        "u.Goal, u.userFriendID, u.imageAvatar, "
+        "COALESCE(u.kachballs, 0) "
         "FROM Friends f "
         "JOIN USERS u ON u.user_id = f.to_user_id "
         "WHERE f.from_user_id = :uid AND f.status = 'accepted' "
@@ -3411,6 +3656,7 @@ bool UserManager::getFriends(int userId, QString &jsonData)
         QByteArray avatarBlob = q.value(6).toByteArray();
         if (!avatarBlob.isEmpty())
             obj["avatar"] = QString::fromLatin1(avatarBlob.toBase64());
+        obj["kachballs"] = q.value(7).toInt();
         arr.append(obj);
     }
     jsonData = QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
@@ -3430,4 +3676,772 @@ bool UserManager::removeFriend(int myUserId, int friendUserId)
     q.bindValue(":b2", friendUserId);
     q.bindValue(":a2", myUserId);
     return q.exec();
+}
+
+// ==================== ДОСТИЖЕНИЯ И КАЧБАЛЛЫ ====================
+
+// ---------------------------------------------------------------------------
+// Получить список достижений пользователя (полученные + все доступные)
+// ---------------------------------------------------------------------------
+bool UserManager::getUserAchievements(int user_id, QString &jsonData)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    q.prepare(
+        "SELECT a.id, a.key, a.name, a.description, a.category, a.reward, a.threshold, "
+        "       ua.earned_at "
+        "FROM Achievements a "
+        "LEFT JOIN User_Achievements ua ON ua.achievement_id = a.id AND ua.user_id = :uid "
+        "ORDER BY a.category, a.id");
+    q.bindValue(":uid", user_id);
+    if (!q.exec()) {
+        qWarning() << "getUserAchievements error:" << q.lastError().text();
+        return false;
+    }
+
+    QJsonArray arr;
+    while (q.next()) {
+        QJsonObject obj;
+        obj["id"]          = q.value(0).toInt();
+        obj["key"]         = q.value(1).toString();
+        obj["name"]        = q.value(2).toString();
+        obj["description"] = q.value(3).toString();
+        obj["category"]    = q.value(4).toString();
+        obj["reward"]      = q.value(5).toInt();
+        obj["threshold"]   = q.value(6).toInt();
+        obj["earned"]      = !q.value(7).isNull();
+        obj["earnedAt"]    = q.value(7).toString();
+        arr.append(obj);
+    }
+    jsonData = QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Получить количество качбаллов
+// ---------------------------------------------------------------------------
+bool UserManager::getUserKachballs(int user_id, int &kachballs)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    q.prepare("SELECT COALESCE(kachballs, 0) FROM USERS WHERE user_id = :uid");
+    q.bindValue(":uid", user_id);
+    if (!q.exec() || !q.next()) return false;
+    kachballs = q.value(0).toInt();
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Проверить и выдать новые достижения. Возвращает JSON-массив НОВЫХ.
+// ---------------------------------------------------------------------------
+bool UserManager::checkAndGrantAchievements(int user_id, QString &newAchievementsJson)
+{
+    if (!db.isOpen()) return false;
+
+    // Собираем статистику пользователя
+    struct Stat {
+        int totalWorkouts   = 0;
+        int weeksCompleted  = 0;
+        int planCompleted   = 0;   // 0 or 1
+        int friendsCount    = 0;
+        int reviewsCount    = 0;
+        int measurementsCount = 0;
+        int nutritionDays   = 0;
+        int nutritionStreak = 0;
+    } s;
+
+    // --- Общее число завершённых тренировок (workout1+2+3 по всем неделям) ---
+    {
+        QSqlQuery q(db);
+        q.prepare(
+            "SELECT COALESCE(workout1_done,0) + COALESCE(workout2_done,0) + COALESCE(workout3_done,0), "
+            "       current_week, week_completed "
+            "FROM Training_Week_Progress WHERE user_id = :uid");
+        q.bindValue(":uid", user_id);
+        if (q.exec() && q.next()) {
+            int doneThisWeek = q.value(0).toInt();
+            int currentWeek  = q.value(1).toInt();
+            int weekDone     = q.value(2).toInt();
+
+            // Завершённые предыдущие недели * 3 + текущая
+            s.weeksCompleted  = currentWeek - 1 + (weekDone ? 1 : 0);
+            s.totalWorkouts   = (currentWeek - 1) * 3 + doneThisWeek;
+        }
+    }
+
+    // --- Статистика по weekly stats (более точный подсчёт) ---
+    {
+        QSqlQuery q(db);
+        q.prepare("SELECT COUNT(DISTINCT week_num) FROM Workout_Weekly_Stats WHERE user_id = :uid");
+        q.bindValue(":uid", user_id);
+        if (q.exec() && q.next()) {
+            int statsWeeks = q.value(0).toInt();
+            if (statsWeeks > s.weeksCompleted)
+                s.weeksCompleted = statsWeeks;
+        }
+    }
+
+    // --- План завершён? ---
+    {
+        QSqlQuery q(db);
+        q.prepare("SELECT plan_start_date FROM Training_Week_Progress WHERE user_id = :uid");
+        q.bindValue(":uid", user_id);
+        if (q.exec() && q.next()) {
+            QString psd = q.value(0).toString();
+            if (!psd.isEmpty()) {
+                QDateTime start = QDateTime::fromString(psd, Qt::ISODate);
+                if (start.isValid() && start.daysTo(QDateTime::currentDateTime()) >= 56)
+                    s.planCompleted = 1;
+            }
+        }
+    }
+
+    // --- Друзья ---
+    {
+        QSqlQuery q(db);
+        q.prepare("SELECT COUNT(*) FROM Friends WHERE from_user_id = :uid AND status = 'accepted'");
+        q.bindValue(":uid", user_id);
+        if (q.exec() && q.next())
+            s.friendsCount = q.value(0).toInt();
+    }
+
+    // --- Отзывы ---
+    {
+        QSqlQuery q(db);
+        q.prepare("SELECT COUNT(*) FROM Recipe_Reviews WHERE user_id = :uid");
+        q.bindValue(":uid", user_id);
+        if (q.exec() && q.next())
+            s.reviewsCount = q.value(0).toInt();
+    }
+
+    // --- Замеры ---
+    {
+        QSqlQuery q(db);
+        q.prepare("SELECT COUNT(*) FROM UserMeasurements WHERE UserId = :uid");
+        q.bindValue(":uid", user_id);
+        if (q.exec() && q.next())
+            s.measurementsCount = q.value(0).toInt();
+    }
+
+    // --- Питание: общее число дней и streak ---
+    {
+        QSqlQuery q(db);
+        q.prepare("SELECT log_date FROM Daily_Nutrition_Log WHERE user_id = :uid ORDER BY log_date DESC");
+        q.bindValue(":uid", user_id);
+        if (q.exec()) {
+            QVector<QDate> dates;
+            while (q.next())
+                dates.append(QDate::fromString(q.value(0).toString(), "yyyy-MM-dd"));
+            s.nutritionDays = dates.size();
+
+            // Считаем streak от сегодня назад
+            if (!dates.isEmpty()) {
+                s.nutritionStreak = 1;
+                for (int i = 1; i < dates.size(); ++i) {
+                    if (dates[i-1].toJulianDay() - dates[i].toJulianDay() == 1)
+                        s.nutritionStreak++;
+                    else
+                        break;
+                }
+            }
+        }
+    }
+
+    // --- Сопоставляем ключи с порогами ---
+    QMap<QString, int> progress;
+    progress["first_workout"]     = s.totalWorkouts;
+    progress["workouts_10"]       = s.totalWorkouts;
+    progress["workouts_50"]       = s.totalWorkouts;
+    progress["workouts_100"]      = s.totalWorkouts;
+    progress["week_complete"]     = s.weeksCompleted;
+    progress["plan_complete"]     = s.planCompleted;
+    progress["weeks_4"]           = s.weeksCompleted;
+    progress["first_friend"]      = s.friendsCount;
+    progress["friends_5"]         = s.friendsCount;
+    progress["friends_10"]        = s.friendsCount;
+    progress["first_review"]      = s.reviewsCount;
+    progress["reviews_5"]         = s.reviewsCount;
+    progress["first_measurement"] = s.measurementsCount;
+    progress["measurements_10"]   = s.measurementsCount;
+    progress["nutrition_7_days"]  = s.nutritionStreak;
+    progress["nutrition_30_days"] = s.nutritionStreak;
+    progress["first_nutrition"]   = s.nutritionDays;
+
+    // --- Проверяем каждое достижение ---
+    QJsonArray newArr;
+    QSqlQuery allAch(db);
+    allAch.exec("SELECT id, key, name, description, category, reward, threshold FROM Achievements");
+    while (allAch.next()) {
+        int    achId     = allAch.value(0).toInt();
+        QString key      = allAch.value(1).toString();
+        QString name     = allAch.value(2).toString();
+        QString desc     = allAch.value(3).toString();
+        QString category = allAch.value(4).toString();
+        int    reward    = allAch.value(5).toInt();
+        int    threshold = allAch.value(6).toInt();
+
+        // Уже получено?
+        QSqlQuery chk(db);
+        chk.prepare("SELECT 1 FROM User_Achievements WHERE user_id = :uid AND achievement_id = :aid");
+        chk.bindValue(":uid", user_id);
+        chk.bindValue(":aid", achId);
+        if (chk.exec() && chk.next())
+            continue;  // уже есть
+
+        // Хватает прогресса?
+        int userProgress = progress.value(key, 0);
+        if (userProgress < threshold)
+            continue;  // не дотянул
+
+        // Выдаём!
+        QSqlQuery grant(db);
+        grant.prepare("INSERT OR IGNORE INTO User_Achievements (user_id, achievement_id) VALUES (:uid, :aid)");
+        grant.bindValue(":uid", user_id);
+        grant.bindValue(":aid", achId);
+        if (!grant.exec()) {
+            qWarning() << "Failed to grant achievement" << key << ":" << grant.lastError().text();
+            continue;
+        }
+
+        // Начисляем качбаллы
+        QSqlQuery addBalls(db);
+        addBalls.prepare("UPDATE USERS SET kachballs = COALESCE(kachballs, 0) + :reward WHERE user_id = :uid");
+        addBalls.bindValue(":reward", reward);
+        addBalls.bindValue(":uid",    user_id);
+        addBalls.exec();
+
+        QJsonObject obj;
+        obj["id"]          = achId;
+        obj["key"]         = key;
+        obj["name"]        = name;
+        obj["description"] = desc;
+        obj["category"]    = category;
+        obj["reward"]      = reward;
+        newArr.append(obj);
+
+        qDebug() << "🏆 Achievement granted:" << key << "to user" << user_id << "(+" << reward << " kachballs)";
+    }
+
+    newAchievementsJson = QString::fromUtf8(QJsonDocument(newArr).toJson(QJsonDocument::Compact));
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Получить/создать еженедельные миссии
+// ---------------------------------------------------------------------------
+bool UserManager::getWeeklyMissions(int user_id, int year, int week, QString &jsonData)
+{
+    if (!db.isOpen()) return false;
+
+    // Убедимся, что запись существует
+    QSqlQuery ins(db);
+    ins.prepare("INSERT OR IGNORE INTO Weekly_Missions (user_id, year, week_num) "
+                "VALUES (:uid, :yr, :wk)");
+    ins.bindValue(":uid", user_id);
+    ins.bindValue(":yr",  year);
+    ins.bindValue(":wk",  week);
+    ins.exec();
+
+    QSqlQuery q(db);
+    q.prepare("SELECT steps_done, workouts_done, nutrition_done, "
+              "       steps_rewarded, workouts_rewarded, nutrition_rewarded, full_bonus_rewarded "
+              "FROM Weekly_Missions WHERE user_id=:uid AND year=:yr AND week_num=:wk");
+    q.bindValue(":uid", user_id);
+    q.bindValue(":yr",  year);
+    q.bindValue(":wk",  week);
+    if (!q.exec() || !q.next()) return false;
+
+    QJsonObject obj;
+    obj["year"]               = year;
+    obj["week"]               = week;
+    obj["steps_done"]         = q.value(0).toInt() == 1;
+    obj["workouts_done"]      = q.value(1).toInt() == 1;
+    obj["nutrition_done"]     = q.value(2).toInt() == 1;
+    obj["steps_rewarded"]     = q.value(3).toInt() == 1;
+    obj["workouts_rewarded"]  = q.value(4).toInt() == 1;
+    obj["nutrition_rewarded"] = q.value(5).toInt() == 1;
+    obj["full_bonus_rewarded"]= q.value(6).toInt() == 1;
+    obj["kachballs_awarded"]  = 0;  // не начислялось при этом запросе
+
+    jsonData = QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Обновить миссии и начислить кач-баллы за новые выполнения
+// ---------------------------------------------------------------------------
+bool UserManager::updateWeeklyMissions(int user_id, int year, int week,
+                                       bool steps_done, bool workouts_done, bool nutrition_done,
+                                       int &kachballs_awarded, QString &jsonData)
+{
+    if (!db.isOpen()) return false;
+    kachballs_awarded = 0;
+
+    // Создаём запись если нет
+    QSqlQuery ins(db);
+    ins.prepare("INSERT OR IGNORE INTO Weekly_Missions (user_id, year, week_num) "
+                "VALUES (:uid, :yr, :wk)");
+    ins.bindValue(":uid", user_id);
+    ins.bindValue(":yr",  year);
+    ins.bindValue(":wk",  week);
+    ins.exec();
+
+    // Читаем текущее состояние
+    QSqlQuery cur(db);
+    cur.prepare("SELECT steps_done, workouts_done, nutrition_done, "
+                "       steps_rewarded, workouts_rewarded, nutrition_rewarded, full_bonus_rewarded "
+                "FROM Weekly_Missions WHERE user_id=:uid AND year=:yr AND week_num=:wk");
+    cur.bindValue(":uid", user_id);
+    cur.bindValue(":yr",  year);
+    cur.bindValue(":wk",  week);
+    if (!cur.exec() || !cur.next()) return false;
+
+    bool cur_steps_done      = cur.value(0).toInt() == 1;
+    bool cur_workouts_done   = cur.value(1).toInt() == 1;
+    bool cur_nutrition_done  = cur.value(2).toInt() == 1;
+    bool steps_rewarded      = cur.value(3).toInt() == 1;
+    bool workouts_rewarded   = cur.value(4).toInt() == 1;
+    bool nutrition_rewarded  = cur.value(5).toInt() == 1;
+    bool full_bonus_rewarded = cur.value(6).toInt() == 1;
+
+    // Новые значения (не откатываем уже выполненное)
+    bool new_steps     = cur_steps_done     || steps_done;
+    bool new_workouts  = cur_workouts_done  || workouts_done;
+    bool new_nutrition = cur_nutrition_done || nutrition_done;
+
+    // Начисляем баллы за новые выполнения
+    int earned = 0;
+    int new_steps_rew = steps_rewarded     ? 1 : 0;
+    int new_work_rew  = workouts_rewarded  ? 1 : 0;
+    int new_nutr_rew  = nutrition_rewarded ? 1 : 0;
+    int new_full_rew  = full_bonus_rewarded ? 1 : 0;
+
+    if (new_steps && !steps_rewarded) {
+        earned += 10;
+        new_steps_rew = 1;
+    }
+    if (new_workouts && !workouts_rewarded) {
+        earned += 20;
+        new_work_rew = 1;
+    }
+    if (new_nutrition && !nutrition_rewarded) {
+        earned += 10;
+        new_nutr_rew = 1;
+    }
+    if (new_steps && new_workouts && new_nutrition && !full_bonus_rewarded) {
+        earned += 10;   // бонус за все три
+        new_full_rew = 1;
+    }
+
+    // Сохраняем
+    QSqlQuery upd(db);
+    upd.prepare("UPDATE Weekly_Missions SET "
+                "steps_done=:sd, workouts_done=:wd, nutrition_done=:nd, "
+                "steps_rewarded=:sr, workouts_rewarded=:wr, nutrition_rewarded=:nr, full_bonus_rewarded=:fr "
+                "WHERE user_id=:uid AND year=:yr AND week_num=:wk");
+    upd.bindValue(":sd", new_steps     ? 1 : 0);
+    upd.bindValue(":wd", new_workouts  ? 1 : 0);
+    upd.bindValue(":nd", new_nutrition ? 1 : 0);
+    upd.bindValue(":sr", new_steps_rew);
+    upd.bindValue(":wr", new_work_rew);
+    upd.bindValue(":nr", new_nutr_rew);
+    upd.bindValue(":fr", new_full_rew);
+    upd.bindValue(":uid", user_id);
+    upd.bindValue(":yr",  year);
+    upd.bindValue(":wk",  week);
+    if (!upd.exec()) return false;
+
+    // Начисляем кач-баллы
+    if (earned > 0) {
+        QSqlQuery addB(db);
+        addB.prepare("UPDATE USERS SET kachballs = COALESCE(kachballs,0) + :pts WHERE user_id = :uid");
+        addB.bindValue(":pts", earned);
+        addB.bindValue(":uid", user_id);
+        addB.exec();
+        qDebug() << "💰 Weekly missions kachballs +" << earned << "for user" << user_id;
+    }
+
+    kachballs_awarded = earned;
+
+    // Возвращаем актуальный JSON
+    QJsonObject obj;
+    obj["year"]                = year;
+    obj["week"]                = week;
+    obj["steps_done"]          = new_steps;
+    obj["workouts_done"]       = new_workouts;
+    obj["nutrition_done"]      = new_nutrition;
+    obj["steps_rewarded"]      = new_steps_rew == 1;
+    obj["workouts_rewarded"]   = new_work_rew  == 1;
+    obj["nutrition_rewarded"]  = new_nutr_rew  == 1;
+    obj["full_bonus_rewarded"] = new_full_rew  == 1;
+    obj["kachballs_awarded"]   = earned;
+
+    jsonData = QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+    return true;
+}
+
+// =====================================================================
+// ✅ PLAN 2 — 5 новых упражнений
+// =====================================================================
+
+bool UserManager::saveTrainingHipAbductionLeanP2(int user_id, float &approach1, float &approach2, float &approach3)
+{
+    qDebug() << "=== saveTrainingHipAbductionLeanP2 ===" << "User:" << user_id;
+    QSqlQuery query(db);
+    query.prepare("SELECT user_id FROM Save_Training_Hip_Abduction_Lean_P2 WHERE user_id=:user_id");
+    query.bindValue(":user_id", user_id);
+    if (!query.exec()) { qWarning() << query.lastError().text(); return false; }
+    if (query.next()) {
+        QSqlQuery upd(db);
+        upd.prepare("UPDATE Save_Training_Hip_Abduction_Lean_P2 SET Approach1=:a1,Approach2=:a2,Approach3=:a3 WHERE user_id=:uid");
+        upd.bindValue(":a1", approach1); upd.bindValue(":a2", approach2); upd.bindValue(":a3", approach3); upd.bindValue(":uid", user_id);
+        return upd.exec();
+    }
+    QSqlQuery ins(db);
+    ins.prepare("INSERT INTO Save_Training_Hip_Abduction_Lean_P2 (user_id,Approach1,Approach2,Approach3) VALUES(:uid,:a1,:a2,:a3)");
+    ins.bindValue(":uid", user_id); ins.bindValue(":a1", approach1); ins.bindValue(":a2", approach2); ins.bindValue(":a3", approach3);
+    return ins.exec();
+}
+
+bool UserManager::GetSaveTrainingHipAbductionLeanP2(int user_id, float &approach1, float &approach2, float &approach3)
+{
+    qDebug() << "=== GetSaveTrainingHipAbductionLeanP2 ===" << "User:" << user_id;
+    QSqlQuery query(db);
+    query.prepare("SELECT Approach1,Approach2,Approach3 FROM Save_Training_Hip_Abduction_Lean_P2 WHERE user_id=:user_id");
+    query.bindValue(":user_id", user_id);
+    if (!query.exec()) { qWarning() << query.lastError().text(); return false; }
+    if (query.next()) { approach1=query.value(0).toFloat(); approach2=query.value(1).toFloat(); approach3=query.value(2).toFloat(); return true; }
+    return false;
+}
+
+bool UserManager::saveTrainingPushupP2(int user_id, float &approach1, float &approach2, float &approach3)
+{
+    qDebug() << "=== saveTrainingPushupP2 ===" << "User:" << user_id;
+    QSqlQuery query(db);
+    query.prepare("SELECT user_id FROM Save_Training_Pushup_P2 WHERE user_id=:user_id");
+    query.bindValue(":user_id", user_id);
+    if (!query.exec()) { qWarning() << query.lastError().text(); return false; }
+    if (query.next()) {
+        QSqlQuery upd(db);
+        upd.prepare("UPDATE Save_Training_Pushup_P2 SET Approach1=:a1,Approach2=:a2,Approach3=:a3 WHERE user_id=:uid");
+        upd.bindValue(":a1", approach1); upd.bindValue(":a2", approach2); upd.bindValue(":a3", approach3); upd.bindValue(":uid", user_id);
+        return upd.exec();
+    }
+    QSqlQuery ins(db);
+    ins.prepare("INSERT INTO Save_Training_Pushup_P2 (user_id,Approach1,Approach2,Approach3) VALUES(:uid,:a1,:a2,:a3)");
+    ins.bindValue(":uid", user_id); ins.bindValue(":a1", approach1); ins.bindValue(":a2", approach2); ins.bindValue(":a3", approach3);
+    return ins.exec();
+}
+
+bool UserManager::GetSaveTrainingPushupP2(int user_id, float &approach1, float &approach2, float &approach3)
+{
+    qDebug() << "=== GetSaveTrainingPushupP2 ===" << "User:" << user_id;
+    QSqlQuery query(db);
+    query.prepare("SELECT Approach1,Approach2,Approach3 FROM Save_Training_Pushup_P2 WHERE user_id=:user_id");
+    query.bindValue(":user_id", user_id);
+    if (!query.exec()) { qWarning() << query.lastError().text(); return false; }
+    if (query.next()) { approach1=query.value(0).toFloat(); approach2=query.value(1).toFloat(); approach3=query.value(2).toFloat(); return true; }
+    return false;
+}
+
+bool UserManager::saveTrainingHipAbduction90P2(int user_id, float &approach1, float &approach2, float &approach3)
+{
+    qDebug() << "=== saveTrainingHipAbduction90P2 ===" << "User:" << user_id;
+    QSqlQuery query(db);
+    query.prepare("SELECT user_id FROM Save_Training_Hip_Abduction_90_P2 WHERE user_id=:user_id");
+    query.bindValue(":user_id", user_id);
+    if (!query.exec()) { qWarning() << query.lastError().text(); return false; }
+    if (query.next()) {
+        QSqlQuery upd(db);
+        upd.prepare("UPDATE Save_Training_Hip_Abduction_90_P2 SET Approach1=:a1,Approach2=:a2,Approach3=:a3 WHERE user_id=:uid");
+        upd.bindValue(":a1", approach1); upd.bindValue(":a2", approach2); upd.bindValue(":a3", approach3); upd.bindValue(":uid", user_id);
+        return upd.exec();
+    }
+    QSqlQuery ins(db);
+    ins.prepare("INSERT INTO Save_Training_Hip_Abduction_90_P2 (user_id,Approach1,Approach2,Approach3) VALUES(:uid,:a1,:a2,:a3)");
+    ins.bindValue(":uid", user_id); ins.bindValue(":a1", approach1); ins.bindValue(":a2", approach2); ins.bindValue(":a3", approach3);
+    return ins.exec();
+}
+
+bool UserManager::GetSaveTrainingHipAbduction90P2(int user_id, float &approach1, float &approach2, float &approach3)
+{
+    qDebug() << "=== GetSaveTrainingHipAbduction90P2 ===" << "User:" << user_id;
+    QSqlQuery query(db);
+    query.prepare("SELECT Approach1,Approach2,Approach3 FROM Save_Training_Hip_Abduction_90_P2 WHERE user_id=:user_id");
+    query.bindValue(":user_id", user_id);
+    if (!query.exec()) { qWarning() << query.lastError().text(); return false; }
+    if (query.next()) { approach1=query.value(0).toFloat(); approach2=query.value(1).toFloat(); approach3=query.value(2).toFloat(); return true; }
+    return false;
+}
+
+bool UserManager::saveTrainingPullupP2(int user_id, float &approach1, float &approach2, float &approach3)
+{
+    qDebug() << "=== saveTrainingPullupP2 ===" << "User:" << user_id;
+    QSqlQuery query(db);
+    query.prepare("SELECT user_id FROM Save_Training_Pullup_P2 WHERE user_id=:user_id");
+    query.bindValue(":user_id", user_id);
+    if (!query.exec()) { qWarning() << query.lastError().text(); return false; }
+    if (query.next()) {
+        QSqlQuery upd(db);
+        upd.prepare("UPDATE Save_Training_Pullup_P2 SET Approach1=:a1,Approach2=:a2,Approach3=:a3 WHERE user_id=:uid");
+        upd.bindValue(":a1", approach1); upd.bindValue(":a2", approach2); upd.bindValue(":a3", approach3); upd.bindValue(":uid", user_id);
+        return upd.exec();
+    }
+    QSqlQuery ins(db);
+    ins.prepare("INSERT INTO Save_Training_Pullup_P2 (user_id,Approach1,Approach2,Approach3) VALUES(:uid,:a1,:a2,:a3)");
+    ins.bindValue(":uid", user_id); ins.bindValue(":a1", approach1); ins.bindValue(":a2", approach2); ins.bindValue(":a3", approach3);
+    return ins.exec();
+}
+
+bool UserManager::GetSaveTrainingPullupP2(int user_id, float &approach1, float &approach2, float &approach3)
+{
+    qDebug() << "=== GetSaveTrainingPullupP2 ===" << "User:" << user_id;
+    QSqlQuery query(db);
+    query.prepare("SELECT Approach1,Approach2,Approach3 FROM Save_Training_Pullup_P2 WHERE user_id=:user_id");
+    query.bindValue(":user_id", user_id);
+    if (!query.exec()) { qWarning() << query.lastError().text(); return false; }
+    if (query.next()) { approach1=query.value(0).toFloat(); approach2=query.value(1).toFloat(); approach3=query.value(2).toFloat(); return true; }
+    return false;
+}
+
+bool UserManager::saveTrainingLegExtensionFrogP2(int user_id, float &approach1, float &approach2, float &approach3)
+{
+    qDebug() << "=== saveTrainingLegExtensionFrogP2 ===" << "User:" << user_id;
+    QSqlQuery query(db);
+    query.prepare("SELECT user_id FROM Save_Training_Leg_Extension_Frog_P2 WHERE user_id=:user_id");
+    query.bindValue(":user_id", user_id);
+    if (!query.exec()) { qWarning() << query.lastError().text(); return false; }
+    if (query.next()) {
+        QSqlQuery upd(db);
+        upd.prepare("UPDATE Save_Training_Leg_Extension_Frog_P2 SET Approach1=:a1,Approach2=:a2,Approach3=:a3 WHERE user_id=:uid");
+        upd.bindValue(":a1", approach1); upd.bindValue(":a2", approach2); upd.bindValue(":a3", approach3); upd.bindValue(":uid", user_id);
+        return upd.exec();
+    }
+    QSqlQuery ins(db);
+    ins.prepare("INSERT INTO Save_Training_Leg_Extension_Frog_P2 (user_id,Approach1,Approach2,Approach3) VALUES(:uid,:a1,:a2,:a3)");
+    ins.bindValue(":uid", user_id); ins.bindValue(":a1", approach1); ins.bindValue(":a2", approach2); ins.bindValue(":a3", approach3);
+    return ins.exec();
+}
+
+bool UserManager::GetSaveTrainingLegExtensionFrogP2(int user_id, float &approach1, float &approach2, float &approach3)
+{
+    qDebug() << "=== GetSaveTrainingLegExtensionFrogP2 ===" << "User:" << user_id;
+    QSqlQuery query(db);
+    query.prepare("SELECT Approach1,Approach2,Approach3 FROM Save_Training_Leg_Extension_Frog_P2 WHERE user_id=:user_id");
+    query.bindValue(":user_id", user_id);
+    if (!query.exec()) { qWarning() << query.lastError().text(); return false; }
+    if (query.next()) { approach1=query.value(0).toFloat(); approach2=query.value(1).toFloat(); approach3=query.value(2).toFloat(); return true; }
+    return false;
+}
+
+// =====================================================================
+// ✅ PLAN 3 — 9 новых упражнений
+// =====================================================================
+
+#define IMPL_SAVE(FuncName, TableName) \
+bool UserManager::FuncName(int user_id, float &approach1, float &approach2, float &approach3) \
+{ \
+    qDebug() << "===" #FuncName "===" << "User:" << user_id; \
+    QSqlQuery query(db); \
+    query.prepare("SELECT user_id FROM " TableName " WHERE user_id=:user_id"); \
+    query.bindValue(":user_id", user_id); \
+    if (!query.exec()) { qWarning() << query.lastError().text(); return false; } \
+    if (query.next()) { \
+        QSqlQuery upd(db); \
+        upd.prepare("UPDATE " TableName " SET Approach1=:a1,Approach2=:a2,Approach3=:a3 WHERE user_id=:uid"); \
+        upd.bindValue(":a1", approach1); upd.bindValue(":a2", approach2); upd.bindValue(":a3", approach3); upd.bindValue(":uid", user_id); \
+        return upd.exec(); \
+    } \
+    QSqlQuery ins(db); \
+    ins.prepare("INSERT INTO " TableName " (user_id,Approach1,Approach2,Approach3) VALUES(:uid,:a1,:a2,:a3)"); \
+    ins.bindValue(":uid", user_id); ins.bindValue(":a1", approach1); ins.bindValue(":a2", approach2); ins.bindValue(":a3", approach3); \
+    return ins.exec(); \
+}
+
+#define IMPL_LOAD(FuncName, TableName) \
+bool UserManager::FuncName(int user_id, float &approach1, float &approach2, float &approach3) \
+{ \
+    qDebug() << "===" #FuncName "===" << "User:" << user_id; \
+    QSqlQuery query(db); \
+    query.prepare("SELECT Approach1,Approach2,Approach3 FROM " TableName " WHERE user_id=:user_id"); \
+    query.bindValue(":user_id", user_id); \
+    if (!query.exec()) { qWarning() << query.lastError().text(); return false; } \
+    if (query.next()) { approach1=query.value(0).toFloat(); approach2=query.value(1).toFloat(); approach3=query.value(2).toFloat(); return true; } \
+    return false; \
+}
+
+// Plan 3
+IMPL_SAVE(saveTrainingCraneP3,                      "Save_Training_Crane_P3")
+IMPL_LOAD(GetSaveTrainingCraneP3,                   "Save_Training_Crane_P3")
+
+IMPL_SAVE(saveTrainingShoulderSideRaiseSitP3,       "Save_Training_Shoulder_Side_Raise_Sit_P3")
+IMPL_LOAD(GetSaveTrainingShoulderSideRaiseSitP3,    "Save_Training_Shoulder_Side_Raise_Sit_P3")
+
+IMPL_SAVE(saveTrainingGoodmorningHackP3,            "Save_Training_Goodmorning_Hack_P3")
+IMPL_LOAD(GetSaveTrainingGoodmorningHackP3,         "Save_Training_Goodmorning_Hack_P3")
+
+IMPL_SAVE(saveTrainingShoulderRaiseOneHandBenchP3,  "Save_Training_Shoulder_Raise_One_Hand_Bench_P3")
+IMPL_LOAD(GetSaveTrainingShoulderRaiseOneHandBenchP3,"Save_Training_Shoulder_Raise_One_Hand_Bench_P3")
+
+IMPL_SAVE(saveTrainingFroggyStandP3,                "Save_Training_Froggy_Stand_P3")
+IMPL_LOAD(GetSaveTrainingFroggyStandP3,             "Save_Training_Froggy_Stand_P3")
+
+IMPL_SAVE(saveTrainingHackSquatP3,                  "Save_Training_Hack_Squat_P3")
+IMPL_LOAD(GetSaveTrainingHackSquatP3,               "Save_Training_Hack_Squat_P3")
+
+IMPL_SAVE(saveTrainingPulloverP3,                   "Save_Training_Pullover_P3")
+IMPL_LOAD(GetSaveTrainingPulloverP3,                "Save_Training_Pullover_P3")
+
+IMPL_SAVE(saveTrainingCrossoverDiagonalKickP3,      "Save_Training_Crossover_Diagonal_Kick_P3")
+IMPL_LOAD(GetSaveTrainingCrossoverDiagonalKickP3,   "Save_Training_Crossover_Diagonal_Kick_P3")
+
+IMPL_SAVE(saveTrainingWallAbductionOneP3,           "Save_Training_Wall_Abduction_One_P3")
+IMPL_LOAD(GetSaveTrainingWallAbductionOneP3,        "Save_Training_Wall_Abduction_One_P3")
+
+// =====================================================================
+// ✅ PLAN 4 — 6 новых упражнений
+// =====================================================================
+
+IMPL_SAVE(saveTrainingCableKickbackP4,              "Save_Training_Cable_Kickback_P4")
+IMPL_LOAD(GetSaveTrainingCableKickbackP4,           "Save_Training_Cable_Kickback_P4")
+
+IMPL_SAVE(saveTrainingCrossoverStepUpP4,            "Save_Training_Crossover_Step_Up_P4")
+IMPL_LOAD(GetSaveTrainingCrossoverStepUpP4,         "Save_Training_Crossover_Step_Up_P4")
+
+IMPL_SAVE(saveTrainingDipsP4,                       "Save_Training_Dips_P4")
+IMPL_LOAD(GetSaveTrainingDipsP4,                    "Save_Training_Dips_P4")
+
+IMPL_SAVE(saveTrainingCableStorkP4,                 "Save_Training_Cable_Stork_P4")
+IMPL_LOAD(GetSaveTrainingCableStorkP4,              "Save_Training_Cable_Stork_P4")
+
+IMPL_SAVE(saveTrainingGluteBridgeSingleLegP4,       "Save_Training_Glute_Bridge_Single_Leg_P4")
+IMPL_LOAD(GetSaveTrainingGluteBridgeSingleLegP4,    "Save_Training_Glute_Bridge_Single_Leg_P4")
+
+IMPL_SAVE(saveTrainingCableRotationP4,              "Save_Training_Cable_Rotation_P4")
+IMPL_LOAD(GetSaveTrainingCableRotationP4,           "Save_Training_Cable_Rotation_P4")
+
+// =====================================================================
+// ✅ PLAN 7 — 4 новых упражнения
+// =====================================================================
+
+IMPL_SAVE(saveTrainingNegativePullupP7,             "Save_Training_Negative_Pullup_P7")
+IMPL_LOAD(GetSaveTrainingNegativePullupP7,          "Save_Training_Negative_Pullup_P7")
+
+IMPL_SAVE(saveTrainingBarbellBicepCurlP7,           "Save_Training_Barbell_Bicep_Curl_P7")
+IMPL_LOAD(GetSaveTrainingBarbellBicepCurlP7,        "Save_Training_Barbell_Bicep_Curl_P7")
+
+IMPL_SAVE(saveTrainingLegRaiseElbowP7,              "Save_Training_Leg_Raise_Elbow_P7")
+IMPL_LOAD(GetSaveTrainingLegRaiseElbowP7,           "Save_Training_Leg_Raise_Elbow_P7")
+
+IMPL_SAVE(saveTrainingBrachialiscurlP7,             "Save_Training_Brachialis_Curl_P7")
+IMPL_LOAD(GetSaveTrainingBrachialiscurlP7,          "Save_Training_Brachialis_Curl_P7")
+
+// =====================================================================
+// ✅ ADMIN — Лидерборд, обнуление баллов, геймификация
+// =====================================================================
+
+bool UserManager::getLeaderboard(QString &jsonData)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    if (!q.exec("SELECT user_id, first_name, last_name, COALESCE(kachballs,0) AS kb "
+                "FROM USERS WHERE COALESCE(kachballs,0) > 0 ORDER BY kb DESC LIMIT 100")) {
+        qWarning() << "getLeaderboard error:" << q.lastError().text();
+        return false;
+    }
+    QJsonArray arr;
+    int rank = 1;
+    while (q.next()) {
+        QJsonObject obj;
+        obj["rank"]       = rank++;
+        obj["user_id"]    = q.value(0).toInt();
+        obj["first_name"] = q.value(1).toString();
+        obj["last_name"]  = q.value(2).toString();
+        obj["kachballs"]  = q.value(3).toInt();
+        arr.append(obj);
+    }
+    jsonData = QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+    qDebug() << "getLeaderboard OK: count=" << arr.size();
+    return true;
+}
+
+bool UserManager::resetAllKachballs()
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    if (!q.exec("UPDATE USERS SET kachballs = 0")) {
+        qWarning() << "resetAllKachballs error:" << q.lastError().text();
+        return false;
+    }
+    qDebug() << "resetAllKachballs OK: rows=" << q.numRowsAffected();
+    return true;
+}
+
+bool UserManager::getGamificationStatus(QString &jsonData)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    if (!q.exec("SELECT start_date, total_days FROM Gamification WHERE id=1")) {
+        qWarning() << "getGamificationStatus error:" << q.lastError().text();
+        return false;
+    }
+    if (!q.next()) {
+        // Таблица пустая — создаём запись
+        QSqlQuery ins(db);
+        ins.exec("INSERT OR IGNORE INTO Gamification (id, start_date, total_days) VALUES (1, date('now'), 90)");
+        q.exec("SELECT start_date, total_days FROM Gamification WHERE id=1");
+        if (!q.next()) return false;
+    }
+    QString startDate = q.value(0).toString();
+    int totalDays     = q.value(1).toInt();
+
+    // Текущий день = разница дат + 1
+    QSqlQuery dayQ(db);
+    dayQ.prepare("SELECT CAST(julianday('now') - julianday(:sd) AS INTEGER) + 1");
+    dayQ.bindValue(":sd", startDate);
+    dayQ.exec();
+    int currentDay = 1;
+    if (dayQ.next()) currentDay = qMax(1, qMin(dayQ.value(0).toInt(), totalDays));
+
+    QJsonObject obj;
+    obj["start_date"]   = startDate;
+    obj["total_days"]   = totalDays;
+    obj["current_day"]  = currentDay;
+    jsonData = QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+    qDebug() << "getGamificationStatus OK: day=" << currentDay << "/" << totalDays;
+    return true;
+}
+
+bool UserManager::setGamificationDay(int day)
+{
+    if (!db.isOpen()) return false;
+    if (day < 1) day = 1;
+    // start_date = today - (day-1) days
+    QSqlQuery q(db);
+    q.prepare("UPDATE Gamification SET start_date = date('now', :offset) WHERE id=1");
+    q.bindValue(":offset", QString("-%1 days").arg(day - 1));
+    if (!q.exec()) {
+        qWarning() << "setGamificationDay error:" << q.lastError().text();
+        return false;
+    }
+    if (q.numRowsAffected() == 0) {
+        QSqlQuery ins(db);
+        ins.prepare("INSERT INTO Gamification (id, start_date, total_days) VALUES (1, date('now', :offset), 90)");
+        ins.bindValue(":offset", QString("-%1 days").arg(day - 1));
+        ins.exec();
+    }
+    qDebug() << "setGamificationDay OK: day=" << day;
+    return true;
+}
+
+bool UserManager::resetGamification()
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    if (!q.exec("UPDATE Gamification SET start_date = date('now') WHERE id=1")) {
+        qWarning() << "resetGamification error:" << q.lastError().text();
+        return false;
+    }
+    qDebug() << "resetGamification OK";
+    return true;
 }

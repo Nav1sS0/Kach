@@ -1316,6 +1316,502 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         }
     }
 
+    // ✅ Plan 2 — HIP_ABDUCTION_LEAN_P2
+    else if(command.startsWith("SAVE_TRAINING_HIP_ABDUCTION_LEAN_P2|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 5) {
+            int user_id = parts.at(1).toInt();
+            float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
+            if(UserManagers.saveTrainingHipAbductionLeanP2(user_id,a1,a2,a3))
+                SendToClient(currentSocket,"SAVE_TRAINING_HIP_ABDUCTION_LEAN_P2_SUCCESS");
+            else SendToClient(currentSocket,"SAVE_TRAINING_HIP_ABDUCTION_LEAN_P2_FAILED");
+        }
+    }
+    else if(command.startsWith("LOAD_TRAINING_HIP_ABDUCTION_LEAN_P2|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 2) {
+            int user_id=parts.at(1).toInt(); float a1=0,a2=0,a3=0;
+            if(UserManagers.GetSaveTrainingHipAbductionLeanP2(user_id,a1,a2,a3))
+                SendToClient(currentSocket,QString("LOAD_TRAINING_HIP_ABDUCTION_LEAN_P2_SUCCESS|%1|%2|%3").arg(a1).arg(a2).arg(a3));
+            else SendToClient(currentSocket,"LOAD_TRAINING_HIP_ABDUCTION_LEAN_P2_FAILED");
+        }
+    }
+    // ✅ Plan 2 — PUSHUP_P2
+    else if(command.startsWith("SAVE_TRAINING_PUSHUP_P2|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 5) {
+            int user_id = parts.at(1).toInt();
+            float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
+            if(UserManagers.saveTrainingPushupP2(user_id,a1,a2,a3))
+                SendToClient(currentSocket,"SAVE_TRAINING_PUSHUP_P2_SUCCESS");
+            else SendToClient(currentSocket,"SAVE_TRAINING_PUSHUP_P2_FAILED");
+        }
+    }
+    else if(command.startsWith("LOAD_TRAINING_PUSHUP_P2|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 2) {
+            int user_id=parts.at(1).toInt(); float a1=0,a2=0,a3=0;
+            if(UserManagers.GetSaveTrainingPushupP2(user_id,a1,a2,a3))
+                SendToClient(currentSocket,QString("LOAD_TRAINING_PUSHUP_P2_SUCCESS|%1|%2|%3").arg(a1).arg(a2).arg(a3));
+            else SendToClient(currentSocket,"LOAD_TRAINING_PUSHUP_P2_FAILED");
+        }
+    }
+    // ✅ Plan 2 — HIP_ABDUCTION_90_P2
+    else if(command.startsWith("SAVE_TRAINING_HIP_ABDUCTION_90_P2|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 5) {
+            int user_id = parts.at(1).toInt();
+            float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
+            if(UserManagers.saveTrainingHipAbduction90P2(user_id,a1,a2,a3))
+                SendToClient(currentSocket,"SAVE_TRAINING_HIP_ABDUCTION_90_P2_SUCCESS");
+            else SendToClient(currentSocket,"SAVE_TRAINING_HIP_ABDUCTION_90_P2_FAILED");
+        }
+    }
+    else if(command.startsWith("LOAD_TRAINING_HIP_ABDUCTION_90_P2|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 2) {
+            int user_id=parts.at(1).toInt(); float a1=0,a2=0,a3=0;
+            if(UserManagers.GetSaveTrainingHipAbduction90P2(user_id,a1,a2,a3))
+                SendToClient(currentSocket,QString("LOAD_TRAINING_HIP_ABDUCTION_90_P2_SUCCESS|%1|%2|%3").arg(a1).arg(a2).arg(a3));
+            else SendToClient(currentSocket,"LOAD_TRAINING_HIP_ABDUCTION_90_P2_FAILED");
+        }
+    }
+    // ✅ Plan 2 — PULLUP_P2
+    else if(command.startsWith("SAVE_TRAINING_PULLUP_P2|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 5) {
+            int user_id = parts.at(1).toInt();
+            float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
+            if(UserManagers.saveTrainingPullupP2(user_id,a1,a2,a3))
+                SendToClient(currentSocket,"SAVE_TRAINING_PULLUP_P2_SUCCESS");
+            else SendToClient(currentSocket,"SAVE_TRAINING_PULLUP_P2_FAILED");
+        }
+    }
+    else if(command.startsWith("LOAD_TRAINING_PULLUP_P2|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 2) {
+            int user_id=parts.at(1).toInt(); float a1=0,a2=0,a3=0;
+            if(UserManagers.GetSaveTrainingPullupP2(user_id,a1,a2,a3))
+                SendToClient(currentSocket,QString("LOAD_TRAINING_PULLUP_P2_SUCCESS|%1|%2|%3").arg(a1).arg(a2).arg(a3));
+            else SendToClient(currentSocket,"LOAD_TRAINING_PULLUP_P2_FAILED");
+        }
+    }
+    // ✅ Plan 2 — LEG_EXTENSION_FROG_P2
+    else if(command.startsWith("SAVE_TRAINING_LEG_EXTENSION_FROG_P2|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 5) {
+            int user_id = parts.at(1).toInt();
+            float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
+            if(UserManagers.saveTrainingLegExtensionFrogP2(user_id,a1,a2,a3))
+                SendToClient(currentSocket,"SAVE_TRAINING_LEG_EXTENSION_FROG_P2_SUCCESS");
+            else SendToClient(currentSocket,"SAVE_TRAINING_LEG_EXTENSION_FROG_P2_FAILED");
+        }
+    }
+    else if(command.startsWith("LOAD_TRAINING_LEG_EXTENSION_FROG_P2|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 2) {
+            int user_id=parts.at(1).toInt(); float a1=0,a2=0,a3=0;
+            if(UserManagers.GetSaveTrainingLegExtensionFrogP2(user_id,a1,a2,a3))
+                SendToClient(currentSocket,QString("LOAD_TRAINING_LEG_EXTENSION_FROG_P2_SUCCESS|%1|%2|%3").arg(a1).arg(a2).arg(a3));
+            else SendToClient(currentSocket,"LOAD_TRAINING_LEG_EXTENSION_FROG_P2_FAILED");
+        }
+    }
+
+    // =====================================================================
+    // ✅ PLAN 3 — 9 новых упражнений
+    // =====================================================================
+
+    // CRANE_P3
+    else if(command.startsWith("SAVE_TRAINING_CRANE_P3|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 5) {
+            int user_id = parts.at(1).toInt();
+            float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
+            if(UserManagers.saveTrainingCraneP3(user_id,a1,a2,a3))
+                SendToClient(currentSocket,"SAVE_TRAINING_CRANE_P3_SUCCESS");
+            else SendToClient(currentSocket,"SAVE_TRAINING_CRANE_P3_FAILED");
+        }
+    }
+    else if(command.startsWith("LOAD_TRAINING_CRANE_P3|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 2) {
+            int user_id=parts.at(1).toInt(); float a1=0,a2=0,a3=0;
+            if(UserManagers.GetSaveTrainingCraneP3(user_id,a1,a2,a3))
+                SendToClient(currentSocket,QString("LOAD_TRAINING_CRANE_P3_SUCCESS|%1|%2|%3").arg(a1).arg(a2).arg(a3));
+            else SendToClient(currentSocket,"LOAD_TRAINING_CRANE_P3_FAILED");
+        }
+    }
+    // SHOULDER_SIDE_RAISE_SIT_P3
+    else if(command.startsWith("SAVE_TRAINING_SHOULDER_SIDE_RAISE_SIT_P3|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 5) {
+            int user_id = parts.at(1).toInt();
+            float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
+            if(UserManagers.saveTrainingShoulderSideRaiseSitP3(user_id,a1,a2,a3))
+                SendToClient(currentSocket,"SAVE_TRAINING_SHOULDER_SIDE_RAISE_SIT_P3_SUCCESS");
+            else SendToClient(currentSocket,"SAVE_TRAINING_SHOULDER_SIDE_RAISE_SIT_P3_FAILED");
+        }
+    }
+    else if(command.startsWith("LOAD_TRAINING_SHOULDER_SIDE_RAISE_SIT_P3|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 2) {
+            int user_id=parts.at(1).toInt(); float a1=0,a2=0,a3=0;
+            if(UserManagers.GetSaveTrainingShoulderSideRaiseSitP3(user_id,a1,a2,a3))
+                SendToClient(currentSocket,QString("LOAD_TRAINING_SHOULDER_SIDE_RAISE_SIT_P3_SUCCESS|%1|%2|%3").arg(a1).arg(a2).arg(a3));
+            else SendToClient(currentSocket,"LOAD_TRAINING_SHOULDER_SIDE_RAISE_SIT_P3_FAILED");
+        }
+    }
+    // GOODMORNING_HACK_P3
+    else if(command.startsWith("SAVE_TRAINING_GOODMORNING_HACK_P3|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 5) {
+            int user_id = parts.at(1).toInt();
+            float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
+            if(UserManagers.saveTrainingGoodmorningHackP3(user_id,a1,a2,a3))
+                SendToClient(currentSocket,"SAVE_TRAINING_GOODMORNING_HACK_P3_SUCCESS");
+            else SendToClient(currentSocket,"SAVE_TRAINING_GOODMORNING_HACK_P3_FAILED");
+        }
+    }
+    else if(command.startsWith("LOAD_TRAINING_GOODMORNING_HACK_P3|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 2) {
+            int user_id=parts.at(1).toInt(); float a1=0,a2=0,a3=0;
+            if(UserManagers.GetSaveTrainingGoodmorningHackP3(user_id,a1,a2,a3))
+                SendToClient(currentSocket,QString("LOAD_TRAINING_GOODMORNING_HACK_P3_SUCCESS|%1|%2|%3").arg(a1).arg(a2).arg(a3));
+            else SendToClient(currentSocket,"LOAD_TRAINING_GOODMORNING_HACK_P3_FAILED");
+        }
+    }
+    // SHOULDER_RAISE_ONE_HAND_BENCH_P3
+    else if(command.startsWith("SAVE_TRAINING_SHOULDER_RAISE_ONE_HAND_BENCH_P3|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 5) {
+            int user_id = parts.at(1).toInt();
+            float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
+            if(UserManagers.saveTrainingShoulderRaiseOneHandBenchP3(user_id,a1,a2,a3))
+                SendToClient(currentSocket,"SAVE_TRAINING_SHOULDER_RAISE_ONE_HAND_BENCH_P3_SUCCESS");
+            else SendToClient(currentSocket,"SAVE_TRAINING_SHOULDER_RAISE_ONE_HAND_BENCH_P3_FAILED");
+        }
+    }
+    else if(command.startsWith("LOAD_TRAINING_SHOULDER_RAISE_ONE_HAND_BENCH_P3|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 2) {
+            int user_id=parts.at(1).toInt(); float a1=0,a2=0,a3=0;
+            if(UserManagers.GetSaveTrainingShoulderRaiseOneHandBenchP3(user_id,a1,a2,a3))
+                SendToClient(currentSocket,QString("LOAD_TRAINING_SHOULDER_RAISE_ONE_HAND_BENCH_P3_SUCCESS|%1|%2|%3").arg(a1).arg(a2).arg(a3));
+            else SendToClient(currentSocket,"LOAD_TRAINING_SHOULDER_RAISE_ONE_HAND_BENCH_P3_FAILED");
+        }
+    }
+    // FROGGY_STAND_P3
+    else if(command.startsWith("SAVE_TRAINING_FROGGY_STAND_P3|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 5) {
+            int user_id = parts.at(1).toInt();
+            float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
+            if(UserManagers.saveTrainingFroggyStandP3(user_id,a1,a2,a3))
+                SendToClient(currentSocket,"SAVE_TRAINING_FROGGY_STAND_P3_SUCCESS");
+            else SendToClient(currentSocket,"SAVE_TRAINING_FROGGY_STAND_P3_FAILED");
+        }
+    }
+    else if(command.startsWith("LOAD_TRAINING_FROGGY_STAND_P3|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 2) {
+            int user_id=parts.at(1).toInt(); float a1=0,a2=0,a3=0;
+            if(UserManagers.GetSaveTrainingFroggyStandP3(user_id,a1,a2,a3))
+                SendToClient(currentSocket,QString("LOAD_TRAINING_FROGGY_STAND_P3_SUCCESS|%1|%2|%3").arg(a1).arg(a2).arg(a3));
+            else SendToClient(currentSocket,"LOAD_TRAINING_FROGGY_STAND_P3_FAILED");
+        }
+    }
+    // HACK_SQUAT_P3
+    else if(command.startsWith("SAVE_TRAINING_HACK_SQUAT_P3|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 5) {
+            int user_id = parts.at(1).toInt();
+            float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
+            if(UserManagers.saveTrainingHackSquatP3(user_id,a1,a2,a3))
+                SendToClient(currentSocket,"SAVE_TRAINING_HACK_SQUAT_P3_SUCCESS");
+            else SendToClient(currentSocket,"SAVE_TRAINING_HACK_SQUAT_P3_FAILED");
+        }
+    }
+    else if(command.startsWith("LOAD_TRAINING_HACK_SQUAT_P3|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 2) {
+            int user_id=parts.at(1).toInt(); float a1=0,a2=0,a3=0;
+            if(UserManagers.GetSaveTrainingHackSquatP3(user_id,a1,a2,a3))
+                SendToClient(currentSocket,QString("LOAD_TRAINING_HACK_SQUAT_P3_SUCCESS|%1|%2|%3").arg(a1).arg(a2).arg(a3));
+            else SendToClient(currentSocket,"LOAD_TRAINING_HACK_SQUAT_P3_FAILED");
+        }
+    }
+    // PULLOVER_P3
+    else if(command.startsWith("SAVE_TRAINING_PULLOVER_P3|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 5) {
+            int user_id = parts.at(1).toInt();
+            float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
+            if(UserManagers.saveTrainingPulloverP3(user_id,a1,a2,a3))
+                SendToClient(currentSocket,"SAVE_TRAINING_PULLOVER_P3_SUCCESS");
+            else SendToClient(currentSocket,"SAVE_TRAINING_PULLOVER_P3_FAILED");
+        }
+    }
+    else if(command.startsWith("LOAD_TRAINING_PULLOVER_P3|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 2) {
+            int user_id=parts.at(1).toInt(); float a1=0,a2=0,a3=0;
+            if(UserManagers.GetSaveTrainingPulloverP3(user_id,a1,a2,a3))
+                SendToClient(currentSocket,QString("LOAD_TRAINING_PULLOVER_P3_SUCCESS|%1|%2|%3").arg(a1).arg(a2).arg(a3));
+            else SendToClient(currentSocket,"LOAD_TRAINING_PULLOVER_P3_FAILED");
+        }
+    }
+    // CROSSOVER_DIAGONAL_KICK_P3
+    else if(command.startsWith("SAVE_TRAINING_CROSSOVER_DIAGONAL_KICK_P3|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 5) {
+            int user_id = parts.at(1).toInt();
+            float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
+            if(UserManagers.saveTrainingCrossoverDiagonalKickP3(user_id,a1,a2,a3))
+                SendToClient(currentSocket,"SAVE_TRAINING_CROSSOVER_DIAGONAL_KICK_P3_SUCCESS");
+            else SendToClient(currentSocket,"SAVE_TRAINING_CROSSOVER_DIAGONAL_KICK_P3_FAILED");
+        }
+    }
+    else if(command.startsWith("LOAD_TRAINING_CROSSOVER_DIAGONAL_KICK_P3|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 2) {
+            int user_id=parts.at(1).toInt(); float a1=0,a2=0,a3=0;
+            if(UserManagers.GetSaveTrainingCrossoverDiagonalKickP3(user_id,a1,a2,a3))
+                SendToClient(currentSocket,QString("LOAD_TRAINING_CROSSOVER_DIAGONAL_KICK_P3_SUCCESS|%1|%2|%3").arg(a1).arg(a2).arg(a3));
+            else SendToClient(currentSocket,"LOAD_TRAINING_CROSSOVER_DIAGONAL_KICK_P3_FAILED");
+        }
+    }
+    // WALL_ABDUCTION_ONE_P3
+    else if(command.startsWith("SAVE_TRAINING_WALL_ABDUCTION_ONE_P3|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 5) {
+            int user_id = parts.at(1).toInt();
+            float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
+            if(UserManagers.saveTrainingWallAbductionOneP3(user_id,a1,a2,a3))
+                SendToClient(currentSocket,"SAVE_TRAINING_WALL_ABDUCTION_ONE_P3_SUCCESS");
+            else SendToClient(currentSocket,"SAVE_TRAINING_WALL_ABDUCTION_ONE_P3_FAILED");
+        }
+    }
+    else if(command.startsWith("LOAD_TRAINING_WALL_ABDUCTION_ONE_P3|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 2) {
+            int user_id=parts.at(1).toInt(); float a1=0,a2=0,a3=0;
+            if(UserManagers.GetSaveTrainingWallAbductionOneP3(user_id,a1,a2,a3))
+                SendToClient(currentSocket,QString("LOAD_TRAINING_WALL_ABDUCTION_ONE_P3_SUCCESS|%1|%2|%3").arg(a1).arg(a2).arg(a3));
+            else SendToClient(currentSocket,"LOAD_TRAINING_WALL_ABDUCTION_ONE_P3_FAILED");
+        }
+    }
+
+    // =====================================================================
+    // ✅ PLAN 4 — 6 новых упражнений
+    // =====================================================================
+
+    // CABLE_KICKBACK_P4
+    else if(command.startsWith("SAVE_TRAINING_CABLE_KICKBACK_P4|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 5) {
+            int user_id = parts.at(1).toInt();
+            float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
+            if(UserManagers.saveTrainingCableKickbackP4(user_id,a1,a2,a3))
+                SendToClient(currentSocket,"SAVE_TRAINING_CABLE_KICKBACK_P4_SUCCESS");
+            else SendToClient(currentSocket,"SAVE_TRAINING_CABLE_KICKBACK_P4_FAILED");
+        }
+    }
+    else if(command.startsWith("LOAD_TRAINING_CABLE_KICKBACK_P4|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 2) {
+            int user_id=parts.at(1).toInt(); float a1=0,a2=0,a3=0;
+            if(UserManagers.GetSaveTrainingCableKickbackP4(user_id,a1,a2,a3))
+                SendToClient(currentSocket,QString("LOAD_TRAINING_CABLE_KICKBACK_P4_SUCCESS|%1|%2|%3").arg(a1).arg(a2).arg(a3));
+            else SendToClient(currentSocket,"LOAD_TRAINING_CABLE_KICKBACK_P4_FAILED");
+        }
+    }
+    // CROSSOVER_STEP_UP_P4
+    else if(command.startsWith("SAVE_TRAINING_CROSSOVER_STEP_UP_P4|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 5) {
+            int user_id = parts.at(1).toInt();
+            float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
+            if(UserManagers.saveTrainingCrossoverStepUpP4(user_id,a1,a2,a3))
+                SendToClient(currentSocket,"SAVE_TRAINING_CROSSOVER_STEP_UP_P4_SUCCESS");
+            else SendToClient(currentSocket,"SAVE_TRAINING_CROSSOVER_STEP_UP_P4_FAILED");
+        }
+    }
+    else if(command.startsWith("LOAD_TRAINING_CROSSOVER_STEP_UP_P4|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 2) {
+            int user_id=parts.at(1).toInt(); float a1=0,a2=0,a3=0;
+            if(UserManagers.GetSaveTrainingCrossoverStepUpP4(user_id,a1,a2,a3))
+                SendToClient(currentSocket,QString("LOAD_TRAINING_CROSSOVER_STEP_UP_P4_SUCCESS|%1|%2|%3").arg(a1).arg(a2).arg(a3));
+            else SendToClient(currentSocket,"LOAD_TRAINING_CROSSOVER_STEP_UP_P4_FAILED");
+        }
+    }
+    // DIPS_P4
+    else if(command.startsWith("SAVE_TRAINING_DIPS_P4|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 5) {
+            int user_id = parts.at(1).toInt();
+            float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
+            if(UserManagers.saveTrainingDipsP4(user_id,a1,a2,a3))
+                SendToClient(currentSocket,"SAVE_TRAINING_DIPS_P4_SUCCESS");
+            else SendToClient(currentSocket,"SAVE_TRAINING_DIPS_P4_FAILED");
+        }
+    }
+    else if(command.startsWith("LOAD_TRAINING_DIPS_P4|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 2) {
+            int user_id=parts.at(1).toInt(); float a1=0,a2=0,a3=0;
+            if(UserManagers.GetSaveTrainingDipsP4(user_id,a1,a2,a3))
+                SendToClient(currentSocket,QString("LOAD_TRAINING_DIPS_P4_SUCCESS|%1|%2|%3").arg(a1).arg(a2).arg(a3));
+            else SendToClient(currentSocket,"LOAD_TRAINING_DIPS_P4_FAILED");
+        }
+    }
+    // CABLE_STORK_P4
+    else if(command.startsWith("SAVE_TRAINING_CABLE_STORK_P4|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 5) {
+            int user_id = parts.at(1).toInt();
+            float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
+            if(UserManagers.saveTrainingCableStorkP4(user_id,a1,a2,a3))
+                SendToClient(currentSocket,"SAVE_TRAINING_CABLE_STORK_P4_SUCCESS");
+            else SendToClient(currentSocket,"SAVE_TRAINING_CABLE_STORK_P4_FAILED");
+        }
+    }
+    else if(command.startsWith("LOAD_TRAINING_CABLE_STORK_P4|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 2) {
+            int user_id=parts.at(1).toInt(); float a1=0,a2=0,a3=0;
+            if(UserManagers.GetSaveTrainingCableStorkP4(user_id,a1,a2,a3))
+                SendToClient(currentSocket,QString("LOAD_TRAINING_CABLE_STORK_P4_SUCCESS|%1|%2|%3").arg(a1).arg(a2).arg(a3));
+            else SendToClient(currentSocket,"LOAD_TRAINING_CABLE_STORK_P4_FAILED");
+        }
+    }
+    // GLUTE_BRIDGE_SINGLE_LEG_P4
+    else if(command.startsWith("SAVE_TRAINING_GLUTE_BRIDGE_SINGLE_LEG_P4|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 5) {
+            int user_id = parts.at(1).toInt();
+            float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
+            if(UserManagers.saveTrainingGluteBridgeSingleLegP4(user_id,a1,a2,a3))
+                SendToClient(currentSocket,"SAVE_TRAINING_GLUTE_BRIDGE_SINGLE_LEG_P4_SUCCESS");
+            else SendToClient(currentSocket,"SAVE_TRAINING_GLUTE_BRIDGE_SINGLE_LEG_P4_FAILED");
+        }
+    }
+    else if(command.startsWith("LOAD_TRAINING_GLUTE_BRIDGE_SINGLE_LEG_P4|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 2) {
+            int user_id=parts.at(1).toInt(); float a1=0,a2=0,a3=0;
+            if(UserManagers.GetSaveTrainingGluteBridgeSingleLegP4(user_id,a1,a2,a3))
+                SendToClient(currentSocket,QString("LOAD_TRAINING_GLUTE_BRIDGE_SINGLE_LEG_P4_SUCCESS|%1|%2|%3").arg(a1).arg(a2).arg(a3));
+            else SendToClient(currentSocket,"LOAD_TRAINING_GLUTE_BRIDGE_SINGLE_LEG_P4_FAILED");
+        }
+    }
+    // CABLE_ROTATION_P4
+    else if(command.startsWith("SAVE_TRAINING_CABLE_ROTATION_P4|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 5) {
+            int user_id = parts.at(1).toInt();
+            float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
+            if(UserManagers.saveTrainingCableRotationP4(user_id,a1,a2,a3))
+                SendToClient(currentSocket,"SAVE_TRAINING_CABLE_ROTATION_P4_SUCCESS");
+            else SendToClient(currentSocket,"SAVE_TRAINING_CABLE_ROTATION_P4_FAILED");
+        }
+    }
+    else if(command.startsWith("LOAD_TRAINING_CABLE_ROTATION_P4|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 2) {
+            int user_id=parts.at(1).toInt(); float a1=0,a2=0,a3=0;
+            if(UserManagers.GetSaveTrainingCableRotationP4(user_id,a1,a2,a3))
+                SendToClient(currentSocket,QString("LOAD_TRAINING_CABLE_ROTATION_P4_SUCCESS|%1|%2|%3").arg(a1).arg(a2).arg(a3));
+            else SendToClient(currentSocket,"LOAD_TRAINING_CABLE_ROTATION_P4_FAILED");
+        }
+    }
+
+    // =====================================================================
+    // ✅ PLAN 7 — 4 новых упражнения
+    // =====================================================================
+
+    // NEGATIVE_PULLUP_P7
+    else if(command.startsWith("SAVE_TRAINING_NEGATIVE_PULLUP_P7|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 5) {
+            int user_id = parts.at(1).toInt();
+            float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
+            if(UserManagers.saveTrainingNegativePullupP7(user_id,a1,a2,a3))
+                SendToClient(currentSocket,"SAVE_TRAINING_NEGATIVE_PULLUP_P7_SUCCESS");
+            else SendToClient(currentSocket,"SAVE_TRAINING_NEGATIVE_PULLUP_P7_FAILED");
+        }
+    }
+    else if(command.startsWith("LOAD_TRAINING_NEGATIVE_PULLUP_P7|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 2) {
+            int user_id=parts.at(1).toInt(); float a1=0,a2=0,a3=0;
+            if(UserManagers.GetSaveTrainingNegativePullupP7(user_id,a1,a2,a3))
+                SendToClient(currentSocket,QString("LOAD_TRAINING_NEGATIVE_PULLUP_P7_SUCCESS|%1|%2|%3").arg(a1).arg(a2).arg(a3));
+            else SendToClient(currentSocket,"LOAD_TRAINING_NEGATIVE_PULLUP_P7_FAILED");
+        }
+    }
+    // BARBELL_BICEP_CURL_P7
+    else if(command.startsWith("SAVE_TRAINING_BARBELL_BICEP_CURL_P7|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 5) {
+            int user_id = parts.at(1).toInt();
+            float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
+            if(UserManagers.saveTrainingBarbellBicepCurlP7(user_id,a1,a2,a3))
+                SendToClient(currentSocket,"SAVE_TRAINING_BARBELL_BICEP_CURL_P7_SUCCESS");
+            else SendToClient(currentSocket,"SAVE_TRAINING_BARBELL_BICEP_CURL_P7_FAILED");
+        }
+    }
+    else if(command.startsWith("LOAD_TRAINING_BARBELL_BICEP_CURL_P7|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 2) {
+            int user_id=parts.at(1).toInt(); float a1=0,a2=0,a3=0;
+            if(UserManagers.GetSaveTrainingBarbellBicepCurlP7(user_id,a1,a2,a3))
+                SendToClient(currentSocket,QString("LOAD_TRAINING_BARBELL_BICEP_CURL_P7_SUCCESS|%1|%2|%3").arg(a1).arg(a2).arg(a3));
+            else SendToClient(currentSocket,"LOAD_TRAINING_BARBELL_BICEP_CURL_P7_FAILED");
+        }
+    }
+    // LEG_RAISE_ELBOW_P7
+    else if(command.startsWith("SAVE_TRAINING_LEG_RAISE_ELBOW_P7|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 5) {
+            int user_id = parts.at(1).toInt();
+            float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
+            if(UserManagers.saveTrainingLegRaiseElbowP7(user_id,a1,a2,a3))
+                SendToClient(currentSocket,"SAVE_TRAINING_LEG_RAISE_ELBOW_P7_SUCCESS");
+            else SendToClient(currentSocket,"SAVE_TRAINING_LEG_RAISE_ELBOW_P7_FAILED");
+        }
+    }
+    else if(command.startsWith("LOAD_TRAINING_LEG_RAISE_ELBOW_P7|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 2) {
+            int user_id=parts.at(1).toInt(); float a1=0,a2=0,a3=0;
+            if(UserManagers.GetSaveTrainingLegRaiseElbowP7(user_id,a1,a2,a3))
+                SendToClient(currentSocket,QString("LOAD_TRAINING_LEG_RAISE_ELBOW_P7_SUCCESS|%1|%2|%3").arg(a1).arg(a2).arg(a3));
+            else SendToClient(currentSocket,"LOAD_TRAINING_LEG_RAISE_ELBOW_P7_FAILED");
+        }
+    }
+    // BRACHIALIS_CURL_P7
+    else if(command.startsWith("SAVE_TRAINING_BRACHIALIS_CURL_P7|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 5) {
+            int user_id = parts.at(1).toInt();
+            float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
+            if(UserManagers.saveTrainingBrachialiscurlP7(user_id,a1,a2,a3))
+                SendToClient(currentSocket,"SAVE_TRAINING_BRACHIALIS_CURL_P7_SUCCESS");
+            else SendToClient(currentSocket,"SAVE_TRAINING_BRACHIALIS_CURL_P7_FAILED");
+        }
+    }
+    else if(command.startsWith("LOAD_TRAINING_BRACHIALIS_CURL_P7|")) {
+        QStringList parts = command.split("|");
+        if(parts.size() >= 2) {
+            int user_id=parts.at(1).toInt(); float a1=0,a2=0,a3=0;
+            if(UserManagers.GetSaveTrainingBrachialiscurlP7(user_id,a1,a2,a3))
+                SendToClient(currentSocket,QString("LOAD_TRAINING_BRACHIALIS_CURL_P7_SUCCESS|%1|%2|%3").arg(a1).arg(a2).arg(a3));
+            else SendToClient(currentSocket,"LOAD_TRAINING_BRACHIALIS_CURL_P7_FAILED");
+        }
+    }
+
     // ✅ ПРОГРЕСС ТРЕНИРОВОК
     else if (command.startsWith("GET_WORKOUT_PROGRESS|")) {
         handleGetWorkoutProgress(currentSocket, command);
@@ -1436,6 +1932,13 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
                 QString reviewsJson;
                 UserManagers.loadReviews(recipe_id, reviewsJson);
                 SendToClient(currentSocket, QString("SAVE_REVIEW_SUCCESS|%1|%2").arg(recipe_id).arg(reviewsJson));
+                // Проверяем достижения за отзывы
+                {
+                    QString newAch;
+                    UserManagers.checkAndGrantAchievements(user_id, newAch);
+                    if (!newAch.isEmpty() && newAch != "[]")
+                        SendToClient(currentSocket, "ACHIEVEMENTS_NEW|" + newAch);
+                }
                 qDebug() << "SAVE_REVIEW: recipe=" << recipe_id << "user=" << user_id;
             } else {
                 SendToClient(currentSocket, "SAVE_REVIEW_FAILED");
@@ -1827,6 +2330,13 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
             int requestId = parts.at(2).toInt();
             if (UserManagers.acceptFriendRequest(myUserId, requestId)) {
                 SendToClient(currentSocket, "ACCEPTFRIENDREQUEST_OK");
+                // Проверяем достижения за друзей
+                {
+                    QString newAch;
+                    UserManagers.checkAndGrantAchievements(myUserId, newAch);
+                    if (!newAch.isEmpty() && newAch != "[]")
+                        SendToClient(currentSocket, "ACHIEVEMENTS_NEW|" + newAch);
+                }
             } else {
                 SendToClient(currentSocket, "ACCEPTFRIENDREQUEST_FAILED");
             }
@@ -1868,6 +2378,134 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
                 SendToClient(currentSocket, "REMOVEFRIEND_OK");
             } else {
                 SendToClient(currentSocket, "REMOVEFRIEND_FAILED");
+            }
+        }
+    }
+
+    // ADMIN_GET_LEADERBOARD — топ 100 по кач-баллам
+    else if (command == "ADMIN_GET_LEADERBOARD") {
+        QString jsonData;
+        if (UserManagers.getLeaderboard(jsonData))
+            SendToClient(currentSocket, "ADMIN_LEADERBOARD_DATA|" + jsonData);
+        else
+            SendToClient(currentSocket, "ADMIN_LEADERBOARD_FAILED");
+    }
+
+    // ADMIN_RESET_ALL_KACHBALLS — обнулить кач-баллы всех пользователей
+    else if (command == "ADMIN_RESET_ALL_KACHBALLS") {
+        if (UserManagers.resetAllKachballs()) {
+            SendToClient(currentSocket, "ADMIN_RESET_KACHBALLS_OK");
+            qDebug() << "ADMIN_RESET_ALL_KACHBALLS: OK";
+        } else {
+            SendToClient(currentSocket, "ADMIN_RESET_KACHBALLS_FAILED");
+        }
+    }
+
+    // ADMIN_GET_GAMIFICATION — получить состояние геймификации
+    else if (command == "ADMIN_GET_GAMIFICATION") {
+        QString jsonData;
+        if (UserManagers.getGamificationStatus(jsonData))
+            SendToClient(currentSocket, "ADMIN_GAMIFICATION_DATA|" + jsonData);
+        else
+            SendToClient(currentSocket, "ADMIN_GAMIFICATION_FAILED");
+    }
+
+    // ADMIN_SET_GAMIFICATION_DAY|day
+    else if (command.startsWith("ADMIN_SET_GAMIFICATION_DAY|")) {
+        int day = command.split("|").at(1).toInt();
+        QString jsonData;
+        if (UserManagers.setGamificationDay(day) && UserManagers.getGamificationStatus(jsonData))
+            SendToClient(currentSocket, "ADMIN_GAMIFICATION_DATA|" + jsonData);
+        else
+            SendToClient(currentSocket, "ADMIN_GAMIFICATION_FAILED");
+    }
+
+    // ADMIN_RESET_GAMIFICATION — сбросить геймификацию на день 1
+    else if (command == "ADMIN_RESET_GAMIFICATION") {
+        QString jsonData;
+        if (UserManagers.resetGamification() && UserManagers.getGamificationStatus(jsonData))
+            SendToClient(currentSocket, "ADMIN_GAMIFICATION_DATA|" + jsonData);
+        else
+            SendToClient(currentSocket, "ADMIN_GAMIFICATION_FAILED");
+    }
+
+    // ==================== ДОСТИЖЕНИЯ И КАЧБАЛЛЫ ====================
+
+    // GET_ACHIEVEMENTS|user_id → ACHIEVEMENTS_DATA|json
+    else if (command.startsWith("GET_ACHIEVEMENTS|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 2) {
+            int user_id = parts.at(1).toInt();
+            QString jsonData;
+            if (UserManagers.getUserAchievements(user_id, jsonData)) {
+                SendToClient(currentSocket, "ACHIEVEMENTS_DATA|" + jsonData);
+                qDebug() << "Achievements loaded for user" << user_id;
+            } else {
+                SendToClient(currentSocket, "ACHIEVEMENTS_FAILED");
+            }
+        }
+    }
+    // CHECK_ACHIEVEMENTS|user_id → ACHIEVEMENTS_NEW|json (новые достижения)
+    else if (command.startsWith("CHECK_ACHIEVEMENTS|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 2) {
+            int user_id = parts.at(1).toInt();
+            QString newJson;
+            if (UserManagers.checkAndGrantAchievements(user_id, newJson)) {
+                SendToClient(currentSocket, "ACHIEVEMENTS_NEW|" + newJson);
+                qDebug() << "Achievements checked for user" << user_id;
+            } else {
+                SendToClient(currentSocket, "ACHIEVEMENTS_CHECK_FAILED");
+            }
+        }
+    }
+    // GET_KACHBALLS|user_id → KACHBALLS|count
+    else if (command.startsWith("GET_KACHBALLS|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 2) {
+            int user_id = parts.at(1).toInt();
+            int kachballs = 0;
+            if (UserManagers.getUserKachballs(user_id, kachballs)) {
+                SendToClient(currentSocket, QString("KACHBALLS|%1").arg(kachballs));
+                qDebug() << "Kachballs for user" << user_id << ":" << kachballs;
+            } else {
+                SendToClient(currentSocket, "KACHBALLS_FAILED");
+            }
+        }
+    }
+    // GET_WEEKLY_MISSIONS|user_id|year|week
+    else if (command.startsWith("GET_WEEKLY_MISSIONS|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 4) {
+            int user_id = parts.at(1).toInt();
+            int year    = parts.at(2).toInt();
+            int week    = parts.at(3).toInt();
+            QString jsonData;
+            if (UserManagers.getWeeklyMissions(user_id, year, week, jsonData)) {
+                SendToClient(currentSocket, "WEEKLY_MISSIONS_DATA|" + jsonData);
+            } else {
+                SendToClient(currentSocket, "WEEKLY_MISSIONS_FAILED");
+            }
+        }
+    }
+    // UPDATE_WEEKLY_MISSIONS|user_id|year|week|steps|workouts|nutrition
+    else if (command.startsWith("UPDATE_WEEKLY_MISSIONS|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 7) {
+            int  user_id    = parts.at(1).toInt();
+            int  year       = parts.at(2).toInt();
+            int  week       = parts.at(3).toInt();
+            bool steps      = parts.at(4).toInt() == 1;
+            bool workouts   = parts.at(5).toInt() == 1;
+            bool nutrition  = parts.at(6).toInt() == 1;
+            int  awarded    = 0;
+            QString jsonData;
+            if (UserManagers.updateWeeklyMissions(user_id, year, week,
+                                                  steps, workouts, nutrition,
+                                                  awarded, jsonData)) {
+                SendToClient(currentSocket, "WEEKLY_MISSIONS_DATA|" + jsonData);
+            } else {
+                SendToClient(currentSocket, "WEEKLY_MISSIONS_FAILED");
             }
         }
     }
@@ -1958,6 +2596,13 @@ void Server::handleMarkWorkoutDone(QTcpSocket* currentSocket, const QString& com
                            .arg(planChangeDue ? 1 : 0);
         SendToClient(currentSocket, resp);
         qDebug() << "✅ MARK_WORKOUT_DONE:" << resp;
+        // Автоматически проверяем новые достижения после тренировки
+        {
+            QString newAch;
+            UserManagers.checkAndGrantAchievements(user_id, newAch);
+            if (!newAch.isEmpty() && newAch != "[]")
+                SendToClient(currentSocket, "ACHIEVEMENTS_NEW|" + newAch);
+        }
     } else {
         SendToClient(currentSocket, "MARK_WORKOUT_DONE_FAILED|db_error");
     }

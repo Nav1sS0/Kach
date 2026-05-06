@@ -150,6 +150,28 @@ public:
     bool removeFriend(int myUserId, int friendUserId);
 
 
+    // ==================== ДОСТИЖЕНИЯ И КАЧБАЛЛЫ ====================
+    // Получить все достижения пользователя (полученные + доступные)
+    bool getUserAchievements(int user_id, QString &jsonData);
+    // Проверить и выдать новые достижения; возвращает JSON новых
+    bool checkAndGrantAchievements(int user_id, QString &newAchievementsJson);
+    // Получить число качбаллов
+    bool getUserKachballs(int user_id, int &kachballs);
+
+    bool getLeaderboard(QString &jsonData);          // топ-100 по кач-баллам
+    bool resetAllKachballs();                         // обнуление баллов всех
+    bool getGamificationStatus(QString &jsonData);   // текущее состояние геймификации
+    bool setGamificationDay(int day);                // установить текущий день вручную
+    bool resetGamification();                         // сбросить геймификацию на день 1
+
+    // ==================== ЕЖЕНЕДЕЛЬНЫЕ МИССИИ ====================
+    // Получить миссии текущей недели; если нет — создаёт запись
+    bool getWeeklyMissions(int user_id, int year, int week, QString &jsonData);
+    // Обновить выполнение миссий; автоматически начисляет кач-баллы
+    bool updateWeeklyMissions(int user_id, int year, int week,
+                              bool steps_done, bool workouts_done, bool nutrition_done,
+                              int &kachballs_awarded, QString &jsonData);
+
     // ✅ SAVE TRAINING - Все 19 тренировок
     bool saveTrainingButtockBridgeP1(int user_id,float &approach1, float &approach2, float &approach3);
     bool saveTrainingChestPressP1(int user_id,float &approach1, float &approach2, float &approach3);
@@ -171,6 +193,13 @@ public:
     bool saveTrainingPlankP1(int user_id,float &approach1, float &approach2, float &approach3);
     bool saveTrainingChestFlyP1(int user_id,float &approach1, float &approach2, float &approach3);
 
+    // ✅ SAVE TRAINING - Plan 2 (5 новых упражнений)
+    bool saveTrainingHipAbductionLeanP2(int user_id, float &approach1, float &approach2, float &approach3);
+    bool saveTrainingPushupP2(int user_id, float &approach1, float &approach2, float &approach3);
+    bool saveTrainingHipAbduction90P2(int user_id, float &approach1, float &approach2, float &approach3);
+    bool saveTrainingPullupP2(int user_id, float &approach1, float &approach2, float &approach3);
+    bool saveTrainingLegExtensionFrogP2(int user_id, float &approach1, float &approach2, float &approach3);
+
     // ✅ GET TRAINING - Все 19 тренировок
     bool GetSaveTrainingButtockBridgeP1(int user_id,float &approach1, float &approach2, float &approach3);
     bool GetSaveTrainingChestPressP1(int user_id,float &approach1, float &approach2, float &approach3);
@@ -191,6 +220,60 @@ public:
     bool GetSaveTrainingLegExtensionP1(int user_id,float &approach1, float &approach2, float &approach3);
     bool GetSaveTrainingPlankP1(int user_id,float &approach1, float &approach2, float &approach3);
     bool GetSaveTrainingChestFlyP1(int user_id,float &approach1, float &approach2, float &approach3);
+
+    // ✅ GET TRAINING - Plan 2 (5 новых упражнений)
+    bool GetSaveTrainingHipAbductionLeanP2(int user_id, float &approach1, float &approach2, float &approach3);
+    bool GetSaveTrainingPushupP2(int user_id, float &approach1, float &approach2, float &approach3);
+    bool GetSaveTrainingHipAbduction90P2(int user_id, float &approach1, float &approach2, float &approach3);
+    bool GetSaveTrainingPullupP2(int user_id, float &approach1, float &approach2, float &approach3);
+    bool GetSaveTrainingLegExtensionFrogP2(int user_id, float &approach1, float &approach2, float &approach3);
+
+    // ✅ SAVE TRAINING - Plan 3 (9 новых упражнений)
+    bool saveTrainingCraneP3(int user_id, float &a1, float &a2, float &a3);
+    bool saveTrainingShoulderSideRaiseSitP3(int user_id, float &a1, float &a2, float &a3);
+    bool saveTrainingGoodmorningHackP3(int user_id, float &a1, float &a2, float &a3);
+    bool saveTrainingShoulderRaiseOneHandBenchP3(int user_id, float &a1, float &a2, float &a3);
+    bool saveTrainingFroggyStandP3(int user_id, float &a1, float &a2, float &a3);
+    bool saveTrainingHackSquatP3(int user_id, float &a1, float &a2, float &a3);
+    bool saveTrainingPulloverP3(int user_id, float &a1, float &a2, float &a3);
+    bool saveTrainingCrossoverDiagonalKickP3(int user_id, float &a1, float &a2, float &a3);
+    bool saveTrainingWallAbductionOneP3(int user_id, float &a1, float &a2, float &a3);
+    // ✅ GET TRAINING - Plan 3
+    bool GetSaveTrainingCraneP3(int user_id, float &a1, float &a2, float &a3);
+    bool GetSaveTrainingShoulderSideRaiseSitP3(int user_id, float &a1, float &a2, float &a3);
+    bool GetSaveTrainingGoodmorningHackP3(int user_id, float &a1, float &a2, float &a3);
+    bool GetSaveTrainingShoulderRaiseOneHandBenchP3(int user_id, float &a1, float &a2, float &a3);
+    bool GetSaveTrainingFroggyStandP3(int user_id, float &a1, float &a2, float &a3);
+    bool GetSaveTrainingHackSquatP3(int user_id, float &a1, float &a2, float &a3);
+    bool GetSaveTrainingPulloverP3(int user_id, float &a1, float &a2, float &a3);
+    bool GetSaveTrainingCrossoverDiagonalKickP3(int user_id, float &a1, float &a2, float &a3);
+    bool GetSaveTrainingWallAbductionOneP3(int user_id, float &a1, float &a2, float &a3);
+
+    // ✅ SAVE TRAINING - Plan 4 (6 новых упражнений)
+    bool saveTrainingCableKickbackP4(int user_id, float &a1, float &a2, float &a3);
+    bool saveTrainingCrossoverStepUpP4(int user_id, float &a1, float &a2, float &a3);
+    bool saveTrainingDipsP4(int user_id, float &a1, float &a2, float &a3);
+    bool saveTrainingCableStorkP4(int user_id, float &a1, float &a2, float &a3);
+    bool saveTrainingGluteBridgeSingleLegP4(int user_id, float &a1, float &a2, float &a3);
+    bool saveTrainingCableRotationP4(int user_id, float &a1, float &a2, float &a3);
+    // ✅ GET TRAINING - Plan 4
+    bool GetSaveTrainingCableKickbackP4(int user_id, float &a1, float &a2, float &a3);
+    bool GetSaveTrainingCrossoverStepUpP4(int user_id, float &a1, float &a2, float &a3);
+    bool GetSaveTrainingDipsP4(int user_id, float &a1, float &a2, float &a3);
+    bool GetSaveTrainingCableStorkP4(int user_id, float &a1, float &a2, float &a3);
+    bool GetSaveTrainingGluteBridgeSingleLegP4(int user_id, float &a1, float &a2, float &a3);
+    bool GetSaveTrainingCableRotationP4(int user_id, float &a1, float &a2, float &a3);
+
+    // ✅ SAVE TRAINING - Plan 7 (4 новых упражнения)
+    bool saveTrainingNegativePullupP7(int user_id, float &a1, float &a2, float &a3);
+    bool saveTrainingBarbellBicepCurlP7(int user_id, float &a1, float &a2, float &a3);
+    bool saveTrainingLegRaiseElbowP7(int user_id, float &a1, float &a2, float &a3);
+    bool saveTrainingBrachialiscurlP7(int user_id, float &a1, float &a2, float &a3);
+    // ✅ GET TRAINING - Plan 7
+    bool GetSaveTrainingNegativePullupP7(int user_id, float &a1, float &a2, float &a3);
+    bool GetSaveTrainingBarbellBicepCurlP7(int user_id, float &a1, float &a2, float &a3);
+    bool GetSaveTrainingLegRaiseElbowP7(int user_id, float &a1, float &a2, float &a3);
+    bool GetSaveTrainingBrachialiscurlP7(int user_id, float &a1, float &a2, float &a3);
 
 private:
     //Объект базы данных
@@ -218,6 +301,9 @@ private:
 
     // Начальные данные рецептов (вызывается один раз, если таблица пустая)
     void seedInitialRecipes();
+
+    // Начальные данные достижений (вызывается один раз, если таблица пустая)
+    void seedAchievements();
 };
 
 #endif // USERMANAGER_H
