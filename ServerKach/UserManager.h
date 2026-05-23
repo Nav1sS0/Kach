@@ -31,7 +31,7 @@ public:
     int checkSubscriptionStatus(const QString &userId);
 
     //Загрузка данных из бд
-    bool loadUserData(int user_id, QString &first_name, QString &last_name, QString &gender, QString &Age, double &height, double &weight, QString &Goal, int &PlanTrainninnUserData, int &standardSubscription);
+    bool loadUserData(int user_id, QString &first_name, QString &last_name, QString &gender, QString &Age, double &height, double &weight, QString &Goal, int &PlanTrainninnUserData, int &standardSubscription, int &vipSubscription, int &subscriptionFrozen, int &feedbackSubscription);
 
     //Обновление данных в БД
     bool updateUserData(int user_id, QString &first_name, QString &last_name,QString &gender, QString &Age, double &height, double &weight, QString &Goal);
@@ -43,10 +43,10 @@ public:
     bool saveEPlanTrainningUserData(int user_id, int &EPlanTrainningUser);
 
     //Замеры
-    bool saveUserMeasurements(int &user_id, QString &Data, QString &Weight, QString &Neck_Circumference, QString &Waist_Circumference, QString &Hip_Circumference, QString &Total_Steps_Day);
+    bool saveUserMeasurements(int &user_id, QString &Data, QString &Weight, QString &Chest_Circumference, QString &Waist_Circumference, QString &Hip_Circumference, QString &Total_Steps_Day);
 
     bool createMeasurement(int user_id, const QString &date, const QString &weight,
-                           const QString &neck, const QString &waist, const QString &hips,
+                           const QString &chest, const QString &waist, const QString &hips,
                            const QString &steps, int &measurement_id);
 
     bool saveMeasurementPhoto(int user_id, int measurement_id, const QString &photoType, const QByteArray &photoData);
@@ -60,8 +60,18 @@ public:
                             bool &w1_done, bool &w2_done, bool &w3_done,
                             QString &w1_date, QString &w2_date, QString &w3_date,
                             bool &plan_completed);
-    bool markWorkoutDone(int user_id, int workout_num, const QString &date);
+    bool markWorkoutDone(int user_id, int workout_num, const QString &date,
+                         int &kachballs_awarded);
     void tryAdvanceWeek(int user_id);
+
+    // ── Призовые баллы (настраиваются админом) ─────────────────────────────
+    // Ключи: "workout_done", "dish_added", "cooked_dish", "lesson_viewed"
+    int  getBonusAmount(const QString &key, int defaultAmount = 0);
+    bool setBonusAmount(const QString &key, int amount);
+    bool getAllBonusSettings(QString &jsonData);
+    // Награда за добавление блюда в рацион (с дедупом «уникальное блюдо в день»)
+    bool addDishToDiet(int user_id, const QString &recipe_name, const QString &date,
+                       int &kachballs_awarded);
 
     // ✅ Сброс прогресса тренировок
     bool resetWorkoutProgress(int user_id);
@@ -70,6 +80,10 @@ public:
     bool savePlanStartDate(int user_id, const QString &datetime);
     bool getPlanStartDate(int user_id, QString &datetime);
     bool isPlanChangeDue(int user_id, bool &due);
+    // Через 90 дней план сбрасывается принудительно (для Lite/Plus —
+    // через resetWorkoutProgress + clear PlanTrainning, для VIP — только
+    // показывается диалог «обратитесь к тренеру»).
+    bool isPlanResetDue(int user_id, bool &due);
 
     // ==================== РЕЦЕПТЫ ====================
 
@@ -120,6 +134,122 @@ public:
     bool getUserWorkoutInfo(int user_id, QString &jsonData);
     bool adminResetUserPlan(int user_id);
 
+    // ✅ Заморозка подписки (1 = заморожена, 0 = активна)
+    bool setSubscriptionFrozen(int user_id, int frozen);
+    bool getSubscriptionFrozen(int user_id, int &frozen);
+    // ✅ Заморозка с авто-разморозкой через N дней + лимит 2 раза в год
+    bool freezeSubscription(int user_id, int days, QString &errorMessage);
+    bool unfreezeSubscription(int user_id);
+    // Возвращает список user_id, у которых freeze_ends_at истёк — для авто-разморозки
+    bool getExpiredFreezes(QList<int> &userIds);
+
+    // ✅ Третий тариф — "С обратной связью"
+    bool setFeedbackSubscription(int user_id, int status);
+    bool getFeedbackSubscription(int user_id, int &status);
+
+    // ==================== АВТО-БИЛЛИНГ (рекуррентные платежи) ==============
+    // Структура одной записи "к списанию"
+    struct BillingDueRow {
+        int     userId;
+        QString tier;              // 'lite' | 'feedback'
+        QString paymentMethodId;
+        int     retryCount;        // 0..3
+        QString email;             // для уведомлений
+        QString firstName;         // для персонализации письма
+    };
+
+    // Сохранить payment_method (после первой успешной оплаты на сайте)
+    bool billingSaveMethod(int user_id,
+                           const QString &paymentMethodId,
+                           const QString &paymentMethodTitle,
+                           const QString &tier,
+                           int periodDays = 30);
+
+    // Список пользователей, у которых next_billing_date <= now AND auto_renew=1
+    // AND payment_method_id != '' AND tier IN ('lite','feedback') AND NOT VIP.
+    // Используется сайтом-cron'ом.
+    bool billingGetDue(QList<BillingDueRow> &rows);
+
+    // Успешное списание: продлить срок (+periodDays), сбросить retry,
+    // разморозить (если была билинг-заморозка) и обновить last_billing_*.
+    bool billingRecordSuccess(int user_id, int periodDays = 30);
+
+    // Неуспешное списание: увеличить retry_count.
+    // Если retry_count < 3 → отложить next_billing_date по схеме (+1д / +3д / +5д).
+    // Если retry_count == 3 → выставить subscription_frozen=1, freeze_reason='billing'.
+    // outFrozen=true означает, что пользователь только что заморожен.
+    bool billingRecordFailure(int user_id, bool &outFrozen);
+
+    // Отменить авто-продление (пользователь через ЛК). Карта остаётся, но списываться
+    // больше не будет до повторного оформления. Текущая подписка работает до конца периода.
+    bool billingCancelAutoRenew(int user_id);
+
+    // Состояние биллинга — для страницы /account на сайте (JSON).
+    bool billingGetState(int user_id, QString &jsonData);
+
+    // ✅ Чат: история сообщений и отправка
+    bool sendChatMessage(int user_id, bool fromAdmin, const QString &text, qint64 &messageId);
+    bool loadChatHistory(int user_id, QString &jsonData);
+    // Сохранить фото-сообщение (text может быть пустой). Возвращает messageId.
+    bool sendChatPhoto(int user_id, bool fromAdmin, const QByteArray &photoData, qint64 &messageId);
+    // Загрузить бинарь фото из конкретного сообщения чата.
+    bool getChatPhoto(qint64 message_id, QByteArray &photoData);
+    // Стереть всю переписку с пользователем (вызывается из «Очистить чат»
+    // как админом, так и пользователем). Возвращает количество удалённых строк.
+    bool clearChatHistory(int user_id, int &deletedCount);
+
+    // ──────────────── Чат техподдержки (доступен всем) ────────────────
+    // Аналогичен чату с тренером, но в отдельной таблице Support_Messages
+    // и БЕЗ проверки подписки — обращения принимаются от любого юзера.
+    bool sendSupportMessage(int user_id, bool fromAdmin, const QString &text, qint64 &messageId);
+    bool sendSupportPhoto(int user_id, bool fromAdmin, const QByteArray &photoData, qint64 &messageId);
+    bool getSupportPhoto(qint64 message_id, QByteArray &photoData);
+    bool loadSupportHistory(int user_id, QString &jsonData);
+    bool markSupportRead(int user_id, bool byAdmin);
+    bool countSupportUnreadForUser(int user_id, int &count);
+    bool getAdminSupportConversations(QString &jsonData);
+    bool clearSupportHistory(int user_id, int &deletedCount);
+    bool markChatRead(int user_id, bool byAdmin);
+    bool getAdminConversations(QString &jsonData);   // список юзеров с непрочитанными
+    bool countUnreadForUser(int user_id, int &count);
+
+    // ✅ Приготовленные блюда (фото) + начисление баллов
+    bool saveCookedDish(int user_id, int recipe_id, const QByteArray &photoData, int &dishId);
+    bool loadCookedDishes(int user_id, QString &jsonData);
+    bool getCookedDishPhoto(int dish_id, QByteArray &photoData);
+
+    // ✅ Просмотренные уроки + начисление баллов (одноразовое)
+    bool markLessonViewed(int user_id, const QString &lessonKey, int &awardedBalls);
+    bool loadViewedLessons(int user_id, QString &jsonData);
+
+    // ✅ Избранные рецепты
+    bool addFavoriteRecipe(int user_id, int recipe_id);
+    bool removeFavoriteRecipe(int user_id, int recipe_id);
+    bool loadFavoriteRecipes(int user_id, QString &jsonData);
+
+    // ✅ Регистрация push-устройств
+    bool registerDevice(int user_id, const QString &token, const QString &platform);
+    bool unregisterDevice(int user_id, const QString &token);
+    bool loadUserDevices(int user_id, QString &jsonData);
+    // Все устройства всех пользователей — для cron-рассылки пушей с сайта.
+    // Возвращает JSON-массив [{user_id, first_name, token, platform}, ...].
+    bool loadAllDevices(QString &jsonData);
+    // Снять регистрацию устройства по токену (когда FCM возвращает 404/UNREGISTERED).
+    bool removeDeviceByToken(const QString &token);
+
+    // ✅ Начисление баллов (универсальный helper)
+    bool addKachballs(int user_id, int amount);
+
+    // ==================== VIP ПЕРСОНАЛЬНЫЕ ПРОГРАММЫ ====================
+    bool setVipSubscription(int user_id, int status);
+    bool getVipSubscription(int user_id, int &status);
+    bool createVipProgram(int user_id, const QString &programName,
+                          const QString &workout1Json, const QString &workout2Json,
+                          const QString &workout3Json);
+    bool loadVipProgram(int user_id, QString &jsonData);
+    bool deleteVipProgram(int user_id);
+    bool clearVipExerciseWeights(int user_id);
+
     // ==================== СТАТИСТИКА ТРЕНИРОВОК ====================
     bool computeAndSaveWeeklyStats(int user_id);
     bool getWorkoutStats(int user_id, QString &jsonData);
@@ -163,6 +293,10 @@ public:
     bool getGamificationStatus(QString &jsonData);   // текущее состояние геймификации
     bool setGamificationDay(int day);                // установить текущий день вручную
     bool resetGamification();                         // сбросить геймификацию на день 1
+
+    // ── Админ: управление наградами за достижения ──
+    bool getAllAchievements(QString &jsonData);
+    bool updateAchievementReward(int achievementId, int newReward);
 
     // ==================== ЕЖЕНЕДЕЛЬНЫЕ МИССИИ ====================
     // Получить миссии текущей недели; если нет — создаёт запись
@@ -275,6 +409,10 @@ public:
     bool GetSaveTrainingLegRaiseElbowP7(int user_id, float &a1, float &a2, float &a3);
     bool GetSaveTrainingBrachialiscurlP7(int user_id, float &a1, float &a2, float &a3);
 
+    // VIP-вес упражнений (generic save/load)
+    bool saveVipExerciseWeight(int user_id, const QString &exerciseName, float a1, float a2, float a3);
+    bool loadVipExerciseWeight(int user_id, const QString &exerciseName, float &a1, float &a2, float &a3);
+
 private:
     //Объект базы данных
     QSqlDatabase db;
@@ -293,8 +431,12 @@ private:
     //Объект данных пользователя
     User userData;
 
-    //Метод для хэширования пароля
+    //Метод для хэширования пароля (legacy — статическая соль)
     void hashPassword(QString &password);
+    // ✅ Новый метод: хеш пароля с per-user солью (защита от rainbow tables)
+    QString hashPasswordWithSalt(const QString &password, const QByteArray &salt) const;
+    // ✅ Генерация криптографически случайной соли (16 байт hex)
+    QByteArray generateSalt() const;
 
     // Инициализация таблиц БД
     void initializeTables();

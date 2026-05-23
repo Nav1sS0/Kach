@@ -8,6 +8,7 @@
 #include <QRandomGenerator>
 #include <QSqlError>
 #include <QCryptographicHash>
+#include <QDateTime>
 
 // ⚠️ ТЕСТОВЫЙ РЕЖИМ: раскомментируй строку ниже для тестирования
 // Тест: неделя = 2 мин, 2 месяца плана = 16 мин
@@ -147,6 +148,18 @@ void UserManager::initializeTables()
     QSqlQuery mig(db);
     mig.exec("ALTER TABLE Training_Week_Progress ADD COLUMN week_completed INTEGER DEFAULT 0");
     mig.exec("ALTER TABLE Training_Week_Progress ADD COLUMN plan_start_date TEXT DEFAULT ''");
+
+    // ── Миграция: переименование Neck_Circumference → Chest_Circumference ──
+    // По ТЗ замер называется «обхват груди». Старая колонка Neck_Circumference
+    // фактически использовалась для груди (label в UI был "Обхват груди"), но
+    // имя поля было ошибочным. Добавляем новую колонку и копируем туда данные;
+    // старая колонка остаётся в БД для безопасности (просто не используется).
+    QSqlQuery measMig(db);
+    measMig.exec("ALTER TABLE UserMeasurements ADD COLUMN Chest_Circumference REAL");
+    measMig.exec(
+        "UPDATE UserMeasurements "
+        "SET Chest_Circumference = Neck_Circumference "
+        "WHERE Chest_Circumference IS NULL AND Neck_Circumference IS NOT NULL");
 
     // ✅ Таблица рецептов (img — BLOB для хранения изображений)
     QSqlQuery rq(db);
@@ -383,6 +396,143 @@ void UserManager::initializeTables()
         // Ошибка = колонка уже есть, это нормально
     }
 
+    // ── Миграция: персональная соль для пароля ────────────────────────────
+    {
+        QSqlQuery mig(db);
+        mig.exec("ALTER TABLE USERS ADD COLUMN password_salt TEXT DEFAULT ''");
+    }
+
+    // ── Миграция: заморозка подписки (1 = заморожена, 0 = активна) ────────
+    {
+        QSqlQuery mig(db);
+        mig.exec("ALTER TABLE USERS ADD COLUMN subscription_frozen INTEGER DEFAULT 0");
+        // Авто-разморозка: дата окончания заморозки (UTC ISO)
+        mig.exec("ALTER TABLE USERS ADD COLUMN freeze_ends_at TEXT DEFAULT ''");
+        // Счётчик заморозок в текущем году
+        mig.exec("ALTER TABLE USERS ADD COLUMN freeze_count_year INTEGER DEFAULT 0");
+        mig.exec("ALTER TABLE USERS ADD COLUMN freeze_year INTEGER DEFAULT 0");
+    }
+
+    // ── Миграция: 3-й уровень подписки — "с обратной связью" ──────────────
+    {
+        QSqlQuery mig(db);
+        mig.exec("ALTER TABLE USERS ADD COLUMN FeedbackSubscription INTEGER DEFAULT 0");
+    }
+
+    // ── Миграция: авто-биллинг (рекуррентные платежи YooKassa) ────────────
+    // Сценарий: пользователь платит на сайте → YooKassa возвращает payment_method_id;
+    // сайт-cron раз в день вызывает ADMIN_BILLING_DUE → списывает с сохранённой карты.
+    // 3 неуспешных попытки подряд → биллинг-заморозка (без квоты 2/год).
+    {
+        QSqlQuery mig(db);
+        // Идентификатор сохранённой карты YooKassa (для рекуррентных списаний)
+        mig.exec("ALTER TABLE USERS ADD COLUMN payment_method_id TEXT DEFAULT ''");
+        // Тариф для авто-биллинга: 'lite' | 'feedback' | '' (VIP не авто-продлевается)
+        mig.exec("ALTER TABLE USERS ADD COLUMN subscription_tier TEXT DEFAULT ''");
+        // Дата следующего автоматического списания (ISO UTC)
+        mig.exec("ALTER TABLE USERS ADD COLUMN next_billing_date TEXT DEFAULT ''");
+        // Счётчик подряд неудачных попыток списания (0..3)
+        mig.exec("ALTER TABLE USERS ADD COLUMN billing_retry_count INTEGER DEFAULT 0");
+        // Флаг "пользователь согласился на авто-продление" (0/1)
+        mig.exec("ALTER TABLE USERS ADD COLUMN subscription_auto_renew INTEGER DEFAULT 0");
+        // Маскированное представление карты ("**** 4242") — показываем в личном кабинете
+        mig.exec("ALTER TABLE USERS ADD COLUMN payment_method_title TEXT DEFAULT ''");
+        // Время последней попытки списания и её исход (для диагностики/UI)
+        mig.exec("ALTER TABLE USERS ADD COLUMN last_billing_attempt_at TEXT DEFAULT ''");
+        mig.exec("ALTER TABLE USERS ADD COLUMN last_billing_status TEXT DEFAULT ''");
+        // Причина текущей заморозки: '' | 'manual' (admin) | 'billing' (auto-failed)
+        mig.exec("ALTER TABLE USERS ADD COLUMN freeze_reason TEXT DEFAULT ''");
+    }
+
+    // ── Таблица сообщений чата (юзер ↔ админ) ─────────────────────────────
+    {
+        QSqlQuery q(db);
+        q.exec(
+            "CREATE TABLE IF NOT EXISTS Chat_Messages ("
+            "  id          INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "  user_id     INTEGER NOT NULL, "       // абонент (не админ)
+            "  from_admin  INTEGER NOT NULL DEFAULT 0, "  // 0 = от пользователя, 1 = от админа
+            "  text        TEXT    NOT NULL, "
+            "  created_at  TEXT    NOT NULL DEFAULT (datetime('now')), "
+            "  read_by_user INTEGER NOT NULL DEFAULT 0, "
+            "  read_by_admin INTEGER NOT NULL DEFAULT 0, "
+            "  FOREIGN KEY(user_id) REFERENCES USERS(user_id))");
+        q.exec("CREATE INDEX IF NOT EXISTS idx_chat_user ON Chat_Messages(user_id, created_at)");
+
+        // Миграция: фото-сообщения в чате (BLOB в той же строке).
+        // Грузится отдельной командой GET_CHAT_PHOTO|message_id, чтобы
+        // история чата (loadChatHistory) не таскала бинарь каждый раз.
+        q.exec("ALTER TABLE Chat_Messages ADD COLUMN photo BLOB DEFAULT NULL");
+    }
+
+    // ── Чат техподдержки (доступен ВСЕМ пользователям, не только Plus/VIP) ──
+    {
+        QSqlQuery q(db);
+        q.exec(
+            "CREATE TABLE IF NOT EXISTS Support_Messages ("
+            "  id            INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "  user_id       INTEGER NOT NULL, "
+            "  from_admin    INTEGER NOT NULL DEFAULT 0, "
+            "  text          TEXT    NOT NULL, "
+            "  photo         BLOB    DEFAULT NULL, "
+            "  created_at    TEXT    NOT NULL DEFAULT (datetime('now')), "
+            "  read_by_user  INTEGER NOT NULL DEFAULT 0, "
+            "  read_by_admin INTEGER NOT NULL DEFAULT 0, "
+            "  FOREIGN KEY(user_id) REFERENCES USERS(user_id))");
+        q.exec("CREATE INDEX IF NOT EXISTS idx_support_user ON Support_Messages(user_id, created_at)");
+    }
+
+    // ── Приготовленные блюда (фото блюда → баллы) ─────────────────────────
+    {
+        QSqlQuery q(db);
+        q.exec(
+            "CREATE TABLE IF NOT EXISTS Cooked_Dishes ("
+            "  id          INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "  user_id     INTEGER NOT NULL, "
+            "  recipe_id   INTEGER, "
+            "  photo       BLOB, "
+            "  created_at  TEXT    NOT NULL DEFAULT (datetime('now')), "
+            "  approved    INTEGER NOT NULL DEFAULT 1, "
+            "  FOREIGN KEY(user_id) REFERENCES USERS(user_id), "
+            "  FOREIGN KEY(recipe_id) REFERENCES Recipes(id))");
+        q.exec("CREATE INDEX IF NOT EXISTS idx_cooked_user ON Cooked_Dishes(user_id, created_at)");
+    }
+
+    // ── Просмотренные уроки (для начисления баллов) ───────────────────────
+    {
+        QSqlQuery q(db);
+        q.exec(
+            "CREATE TABLE IF NOT EXISTS User_Lessons_Viewed ("
+            "  id          INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "  user_id     INTEGER NOT NULL, "
+            "  lesson_key  TEXT    NOT NULL, "
+            "  viewed_at   TEXT    NOT NULL DEFAULT (datetime('now')), "
+            "  UNIQUE(user_id, lesson_key))");
+    }
+
+    // ── Избранные рецепты пользователя ────────────────────────────────────
+    {
+        QSqlQuery q(db);
+        q.exec(
+            "CREATE TABLE IF NOT EXISTS User_Favorite_Recipes ("
+            "  user_id    INTEGER NOT NULL, "
+            "  recipe_id  INTEGER NOT NULL, "
+            "  added_at   TEXT    NOT NULL DEFAULT (datetime('now')), "
+            "  PRIMARY KEY(user_id, recipe_id))");
+    }
+
+    // ── Устройства пользователей для push-уведомлений (FCM/APNS) ──────────
+    {
+        QSqlQuery q(db);
+        q.exec(
+            "CREATE TABLE IF NOT EXISTS User_Devices ("
+            "  user_id      INTEGER NOT NULL, "
+            "  device_token TEXT    NOT NULL, "
+            "  platform     TEXT    NOT NULL, "    // "ios" | "android"
+            "  last_seen    TEXT    NOT NULL DEFAULT (datetime('now')), "
+            "  PRIMARY KEY(user_id, device_token))");
+    }
+
     // ── Каталог достижений ─────────────────────────────────────────────────
     {
         QSqlQuery aq(db);
@@ -419,8 +569,92 @@ void UserManager::initializeTables()
         }
     }
 
+    // ── VIP Персональные программы ──────────────────────────────────────────
+    {
+        QSqlQuery vp(db);
+        vp.exec(
+            "CREATE TABLE IF NOT EXISTS Vip_Programs ("
+            "  id            INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "  user_id       INTEGER UNIQUE NOT NULL, "
+            "  program_name  TEXT NOT NULL, "
+            "  workout1_json TEXT NOT NULL DEFAULT '[]', "
+            "  workout2_json TEXT NOT NULL DEFAULT '[]', "
+            "  workout3_json TEXT NOT NULL DEFAULT '[]', "
+            "  created_at    TEXT NOT NULL, "
+            "  FOREIGN KEY(user_id) REFERENCES USERS(user_id)"
+            ")");
+        if (vp.lastError().isValid())
+            qWarning() << "Failed to create Vip_Programs:" << vp.lastError().text();
+        else
+            qDebug() << "Table ready: Vip_Programs";
+
+        QSqlQuery vw(db);
+        vw.exec(
+            "CREATE TABLE IF NOT EXISTS Vip_Exercise_Weights ("
+            "  id            INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "  user_id       INTEGER NOT NULL, "
+            "  exercise_name TEXT NOT NULL, "
+            "  approach1     REAL DEFAULT 0, "
+            "  approach2     REAL DEFAULT 0, "
+            "  approach3     REAL DEFAULT 0, "
+            "  UNIQUE(user_id, exercise_name)"
+            ")");
+        if (vw.lastError().isValid())
+            qWarning() << "Failed to create Vip_Exercise_Weights:" << vw.lastError().text();
+        else
+            qDebug() << "Table ready: Vip_Exercise_Weights";
+
+        // Add VipSubscription column to USERS if not exists
+        QSqlQuery alter(db);
+        alter.exec("ALTER TABLE USERS ADD COLUMN VipSubscription INTEGER DEFAULT 0");
+        // Ignore error if column already exists
+    }
+
     // ── Заполнить каталог достижений (один раз) ────────────────────────────
     seedAchievements();
+
+    // ── Настройки призовых баллов (редактируются админом) ───────────────────
+    {
+        QSqlQuery bs(db);
+        if (!bs.exec(
+                "CREATE TABLE IF NOT EXISTS Bonus_Settings ("
+                "  key         TEXT PRIMARY KEY, "
+                "  amount      INTEGER NOT NULL DEFAULT 0, "
+                "  description TEXT NOT NULL DEFAULT '')")) {
+            qWarning() << "Failed to create Bonus_Settings:" << bs.lastError().text();
+        } else {
+            qDebug() << "Table ready: Bonus_Settings";
+        }
+
+        struct BonusDef { QString key; int amount; QString desc; };
+        const QVector<BonusDef> defs = {
+            { "workout_done",  15, "За завершённую тренировку" },
+            { "dish_added",     5, "За добавление блюда в рацион" },
+            { "cooked_dish",    5, "За загруженное фото блюда" },
+            { "lesson_viewed",  3, "За просмотренный урок" },
+        };
+        for (const auto &d : defs) {
+            QSqlQuery ins(db);
+            ins.prepare("INSERT OR IGNORE INTO Bonus_Settings (key, amount, description) "
+                        "VALUES (:k, :a, :d)");
+            ins.bindValue(":k", d.key);
+            ins.bindValue(":a", d.amount);
+            ins.bindValue(":d", d.desc);
+            ins.exec();
+        }
+    }
+
+    // ── Дедуп начислений за добавленные блюда (один день — один рецепт) ─────
+    {
+        QSqlQuery dd(db);
+        dd.exec(
+            "CREATE TABLE IF NOT EXISTS Diet_Reward_Log ("
+            "  user_id     INTEGER NOT NULL, "
+            "  date        TEXT    NOT NULL, "
+            "  recipe_name TEXT    NOT NULL, "
+            "  rewarded_at TEXT    NOT NULL DEFAULT (datetime('now')), "
+            "  PRIMARY KEY(user_id, date, recipe_name))");
+    }
 
     // ── Еженедельные миссии ─────────────────────────────────────────────────
     {
@@ -822,33 +1056,77 @@ bool UserManager::addRecipe(const QString &name,
 //Хэширование пароля (SHA-256 + соль)
 void UserManager::hashPassword(QString &password)
 {
+    // ⚠️ LEGACY: одна общая соль для всех. Используется только для проверки
+    // паролей пользователей, зарегистрированных до миграции на per-user salt.
     static const QByteArray salt = QByteArrayLiteral("KachFitness_v1_salt");
     QByteArray data = salt + password.toUtf8();
     QByteArray hash = QCryptographicHash::hash(data, QCryptographicHash::Sha256);
     password = QString::fromLatin1(hash.toHex());
 }
 
+// ✅ Хеш с per-user солью + 100k итераций PBKDF2-подобный stretching через цикл SHA-256
+// (для устойчивости к brute-force даже при утечке БД)
+QString UserManager::hashPasswordWithSalt(const QString &password, const QByteArray &salt) const
+{
+    QByteArray data = salt + password.toUtf8();
+    QByteArray hash = QCryptographicHash::hash(data, QCryptographicHash::Sha256);
+    // Растяжение: 100 000 итераций SHA-256 для замедления brute-force
+    for (int i = 0; i < 100000; ++i) {
+        hash = QCryptographicHash::hash(hash + salt, QCryptographicHash::Sha256);
+    }
+    return QString::fromLatin1(hash.toHex());
+}
+
+// ✅ Криптографически случайная соль 16 байт (=32 hex-символа)
+QByteArray UserManager::generateSalt() const
+{
+    QByteArray salt;
+    salt.reserve(16);
+    for (int i = 0; i < 16; ++i) {
+        salt.append(static_cast<char>(QRandomGenerator::system()->bounded(0, 256)));
+    }
+    return salt.toHex();   // храним как hex-строку
+}
+
 //Функция регистрации пользователся
 bool UserManager::registerUser(const QString &firstName, const QString &lastName, const QString &email, const QString &passwordHash, const QString &gender, const QString &birthDate, double height, double weight, QString &errorMessage, int& userId)
 {
-    //ОбЪект типа запроса
+    // ✅ Валидация входных данных (защита от пустых полей и аномалий)
+    if (email.trimmed().isEmpty() || !email.contains('@')) {
+        errorMessage = "Некорректный email";
+        return false;
+    }
+    if (passwordHash.size() < 6) {
+        errorMessage = "Пароль слишком короткий (минимум 6 символов)";
+        return false;
+    }
+    if (firstName.trimmed().isEmpty() || lastName.trimmed().isEmpty()) {
+        errorMessage = "Имя и фамилия обязательны";
+        return false;
+    }
+    if (height <= 0 || height > 300 || weight <= 0 || weight > 500) {
+        errorMessage = "Некорректные параметры роста/веса";
+        return false;
+    }
+
     QSqlQuery query(db);
 
-    //Хэшируем пароль перед сохранением
-    QString hashed = passwordHash;
-    hashPassword(hashed);
+    // ✅ Генерируем персональную соль и хешируем пароль с ней
+    QByteArray salt = generateSalt();
+    QString hashed = hashPasswordWithSalt(passwordHash, salt);
 
     //Запрос на вставку данных
     query.prepare(
         "INSERT INTO USERS "
-        "(first_name, last_name, email, password_hash, gender, birth_date, height, weight) "
-        "VALUES (:first_name, :last_name, :email, :password_hash, :gender, :birth_date, :height, :weight)");
+        "(first_name, last_name, email, password_hash, password_salt, gender, birth_date, height, weight) "
+        "VALUES (:first_name, :last_name, :email, :password_hash, :password_salt, :gender, :birth_date, :height, :weight)");
 
     //Параметры соответствуют порядку полей
     query.bindValue(":first_name", firstName);
     query.bindValue(":last_name", lastName);
     query.bindValue(":email", email);
     query.bindValue(":password_hash", hashed);
+    query.bindValue(":password_salt", QString::fromLatin1(salt));
     query.bindValue(":gender", gender);
     query.bindValue(":birth_date", birthDate);
     query.bindValue(":height", height);
@@ -898,10 +1176,14 @@ bool UserManager::registerUser(const QString &firstName, const QString &lastName
 //Проверка учетных данных
 bool UserManager::authenticateUser(const QString &email, const QString &password, int& userId)
 {
+    // ✅ Базовая валидация
+    if (email.trimmed().isEmpty() || password.isEmpty())
+        return false;
+
     QSqlQuery query(db);
 
-    // Получаем сохранённый пароль по email
-    query.prepare("SELECT user_id, password_hash FROM users WHERE email=:email");
+    // Получаем сохранённый пароль + соль по email
+    query.prepare("SELECT user_id, password_hash, COALESCE(password_salt, '') FROM users WHERE email=:email");
     query.bindValue(":email", email);
 
     if (!query.exec() || !query.next())
@@ -909,37 +1191,51 @@ bool UserManager::authenticateUser(const QString &email, const QString &password
 
     const int foundId = query.value(0).toInt();
     const QString stored = query.value(1).toString();
+    const QString saltStored = query.value(2).toString();
 
-    // Считаем хэш из введённого пароля
-    QString hashed = password;
-    hashPassword(hashed);
-
-    if (stored.compare(hashed, Qt::CaseInsensitive) == 0) {
-        userId = foundId;
-        return true;
+    // ✅ Новый формат: per-user соль + 100k итераций
+    if (!saltStored.isEmpty()) {
+        const QString newHash = hashPasswordWithSalt(password, saltStored.toLatin1());
+        if (stored.compare(newHash, Qt::CaseInsensitive) == 0) {
+            userId = foundId;
+            return true;
+        }
+        return false;   // соль есть, но не совпадает — отказ
     }
 
-    // Поддержка старых аккаунтов (пароль был сохранён в открытом виде):
-    // если совпал — мигрируем в хэш.
-    if (stored == password) {
+    // ⚠️ LEGACY: пользователь зарегистрирован до миграции (статическая соль)
+    QString hashedOld = password;
+    hashPassword(hashedOld);
+
+    if (stored.compare(hashedOld, Qt::CaseInsensitive) == 0) {
+        // ✅ Миграция на новый формат: генерируем соль и пересохраняем
+        const QByteArray newSalt = generateSalt();
+        const QString newHash = hashPasswordWithSalt(password, newSalt);
         QSqlQuery upd(db);
-        upd.prepare("UPDATE users SET password_hash=:h WHERE user_id=:uid");
-        upd.bindValue(":h", hashed);
+        upd.prepare("UPDATE users SET password_hash=:h, password_salt=:s WHERE user_id=:uid");
+        upd.bindValue(":h", newHash);
+        upd.bindValue(":s", QString::fromLatin1(newSalt));
         upd.bindValue(":uid", foundId);
         if (!upd.exec())
-            qWarning() << "Не удалось мигрировать пароль в хэш:" << upd.lastError().text();
+            qWarning() << "Не удалось мигрировать пароль на новый формат:" << upd.lastError().text();
+        else
+            qDebug() << "✅ Пароль user_id=" << foundId << "мигрирован на per-user salt";
         userId = foundId;
         return true;
     }
 
+    // ⚠️ legacy plaintext fallback УДАЛЁН — это была уязвимость
     return false;
 }
 
 //Загрузка данных из бд
-bool UserManager::loadUserData(int user_id, QString &first_name, QString &last_name, QString &gender, QString &Age, double &height, double &weight, QString &Goal, int &PlanTrainninnUserData, int &standardSubscription)
+bool UserManager::loadUserData(int user_id, QString &first_name, QString &last_name, QString &gender, QString &Age, double &height, double &weight, QString &Goal, int &PlanTrainninnUserData, int &standardSubscription, int &vipSubscription, int &subscriptionFrozen, int &feedbackSubscription)
 {
     QSqlQuery query(db);
-    query.prepare("SELECT first_name, last_name, gender, birth_date, height, weight, Goal, PlanTrainning, StandardSubscription FROM users WHERE user_id=:user_id;");
+    query.prepare("SELECT first_name, last_name, gender, birth_date, height, weight, Goal, PlanTrainning, "
+                  "StandardSubscription, COALESCE(VipSubscription, 0), COALESCE(subscription_frozen, 0), "
+                  "COALESCE(FeedbackSubscription, 0) "
+                  "FROM users WHERE user_id=:user_id;");
     query.bindValue(":user_id", user_id);
 
     if (!query.exec())
@@ -958,7 +1254,17 @@ bool UserManager::loadUserData(int user_id, QString &first_name, QString &last_n
         weight                = query.value(5).toDouble();
         Goal                  = query.value(6).toString();
         PlanTrainninnUserData  = query.value(7).toInt();
-        standardSubscription  = query.value(8).toInt();  // 0 = нет подписки, 1 = есть
+        standardSubscription  = query.value(8).toInt();
+        vipSubscription       = query.value(9).toInt();
+        subscriptionFrozen    = query.value(10).toInt();
+        feedbackSubscription  = query.value(11).toInt();
+
+        // ✅ Если подписка заморожена — обнуляем ВСЕ статусы доступа для клиента.
+        if (subscriptionFrozen) {
+            standardSubscription = 0;
+            vipSubscription = 0;
+            feedbackSubscription = 0;
+        }
         return true;
     }
 
@@ -1161,20 +1467,44 @@ bool UserManager::isPlanChangeDue(int user_id, bool &due)
     return true;
 }
 
-bool UserManager::saveUserMeasurements(int &user_id, QString &Data, QString &Weight, QString &Neck_Circumference, QString &Waist_Circumference, QString &Hip_Circumference, QString &Total_Steps_Day)
+bool UserManager::isPlanResetDue(int user_id, bool &due)
+{
+    QString planStartStr;
+    if (!getPlanStartDate(user_id, planStartStr) || planStartStr.isEmpty()) {
+        due = false;
+        return false;
+    }
+
+    QDateTime planStart = QDateTime::fromString(planStartStr, "yyyy-MM-dd hh:mm:ss");
+    if (!planStart.isValid()) {
+        due = false;
+        return false;
+    }
+
+#ifdef TEST_WEEK_ADVANCE
+    // Тест: 2 минуты = 1 неделя → 3 месяца ≈ 12 недель = 24 минуты
+    due = planStart.secsTo(QDateTime::currentDateTime()) >= 24 * 60;
+#else
+    // 3 месяца = 90 дней
+    due = planStart.daysTo(QDateTime::currentDateTime()) >= 90;
+#endif
+    return true;
+}
+
+bool UserManager::saveUserMeasurements(int &user_id, QString &Data, QString &Weight, QString &Chest_Circumference, QString &Waist_Circumference, QString &Hip_Circumference, QString &Total_Steps_Day)
 {
     // Готовим SQL-запрос для вставки замеров
     QSqlQuery query(db);
 
     query.prepare("INSERT INTO UserMeasurements "
-                  "(UserId, Data, Weight, Neck_Circumference, Waist_Circumference, Hip_Circumference, Total_Steps_Day) "
-                  "VALUES (:UserId, :Data, :Weight, :Neck_Circumference, :Waist_Circumference, :Hip_Circumference, :Total_Steps_Day)");
+                  "(UserId, Data, Weight, Chest_Circumference, Waist_Circumference, Hip_Circumference, Total_Steps_Day) "
+                  "VALUES (:UserId, :Data, :Weight, :Chest_Circumference, :Waist_Circumference, :Hip_Circumference, :Total_Steps_Day)");
 
     //Параметры соответствуют порядку полей
     query.bindValue(":UserId", user_id);
     query.bindValue(":Data", Data);
     query.bindValue(":Weight", Weight);
-    query.bindValue(":Neck_Circumference", Neck_Circumference);
+    query.bindValue(":Chest_Circumference", Chest_Circumference);
     query.bindValue(":Waist_Circumference", Waist_Circumference);
     query.bindValue(":Hip_Circumference", Hip_Circumference);
     query.bindValue(":Total_Steps_Day", Total_Steps_Day);
@@ -1192,7 +1522,7 @@ bool UserManager::saveUserMeasurements(int &user_id, QString &Data, QString &Wei
 }
 
 bool UserManager::createMeasurement(int user_id, const QString &date, const QString &weight,
-                                    const QString &neck, const QString &waist, const QString &hips,
+                                    const QString &chest, const QString &waist, const QString &hips,
                                     const QString &steps, int &measurement_id)
 {
     qDebug() << "=== createMeasurement ===" << "User:" << user_id << "Date:" << date;
@@ -1200,13 +1530,13 @@ bool UserManager::createMeasurement(int user_id, const QString &date, const QStr
     QSqlQuery query(db);
 
     query.prepare("INSERT INTO UserMeasurements "
-                  "(UserId, Data, Weight, Neck_Circumference, Waist_Circumference, Hip_Circumference, Total_Steps_Day) "
-                  "VALUES (:UserId, :Data, :Weight, :Neck_Circumference, :Waist_Circumference, :Hip_Circumference, :Total_Steps_Day)");
+                  "(UserId, Data, Weight, Chest_Circumference, Waist_Circumference, Hip_Circumference, Total_Steps_Day) "
+                  "VALUES (:UserId, :Data, :Weight, :Chest_Circumference, :Waist_Circumference, :Hip_Circumference, :Total_Steps_Day)");
 
     query.bindValue(":UserId", user_id);
     query.bindValue(":Data", date);
     query.bindValue(":Weight", weight.toDouble());
-    query.bindValue(":Neck_Circumference", neck.toDouble());
+    query.bindValue(":Chest_Circumference", chest.toDouble());
     query.bindValue(":Waist_Circumference", waist.toDouble());
     query.bindValue(":Hip_Circumference", hips.toDouble());
     query.bindValue(":Total_Steps_Day", steps.toInt());
@@ -1307,8 +1637,11 @@ bool UserManager::loadUserMeasurements(int user_id, QString &jsonData)
 
     QSqlQuery query(db);
 
-    // Исправлен запрос - правильный SELECT без BLOB полей и правильный порядок
-    query.prepare("SELECT id, Data, Weight, Neck_Circumference, Waist_Circumference, Hip_Circumference, Total_Steps_Day "
+    // SELECT с COALESCE: новые записи лежат в Chest_Circumference, старые
+    // (до миграции) — в Neck_Circumference. Берём ту, что не NULL.
+    query.prepare("SELECT id, Data, Weight, "
+                  "COALESCE(Chest_Circumference, Neck_Circumference, 0), "
+                  "Waist_Circumference, Hip_Circumference, Total_Steps_Day "
                   "FROM UserMeasurements WHERE UserId = :UserId ORDER BY Data DESC");
     query.bindValue(":UserId", user_id);
 
@@ -1325,7 +1658,7 @@ bool UserManager::loadUserMeasurements(int user_id, QString &jsonData)
         obj["id"] = query.value(0).toInt();
         obj["date"] = query.value(1).toString();
         obj["weight"] = query.value(2).toDouble();
-        obj["neckCircumference"] = query.value(3).toDouble();
+        obj["chestCircumference"] = query.value(3).toDouble();
         obj["waistCircumference"] = query.value(4).toDouble();
         obj["hipCircumference"] = query.value(5).toDouble();
         obj["steps"] = query.value(6).toInt();
@@ -2584,11 +2917,13 @@ bool UserManager::getWorkoutProgress(int user_id, int &current_week,
 
 // Отмечает тренировку как выполненную.
 // Если все 3 пройдены — автоматически переходит на следующую неделю (если < 12).
-bool UserManager::markWorkoutDone(int user_id, int workout_num, const QString &date)
+bool UserManager::markWorkoutDone(int user_id, int workout_num, const QString &date,
+                                  int &kachballs_awarded)
 {
     qDebug() << "=== markWorkoutDone === user:" << user_id
              << "workout:" << workout_num << "date:" << date;
 
+    kachballs_awarded = 0;
     if (workout_num < 1 || workout_num > 3) return false;
 
     // Получаем текущий прогресс (и создаём запись если нет)
@@ -2638,6 +2973,13 @@ bool UserManager::markWorkoutDone(int user_id, int workout_num, const QString &d
         if (cw >= 12) {
             qDebug() << "✅ PLAN COMPLETED for user" << user_id;
         }
+    }
+
+    // 💰 Призовые баллы за тренировку (сумма редактируется через админ-панель)
+    int reward = getBonusAmount("workout_done", 15);
+    if (reward > 0 && addKachballs(user_id, reward)) {
+        kachballs_awarded = reward;
+        qDebug() << "💰 Workout reward +" << reward << "kachballs for user" << user_id;
     }
 
     return true;
@@ -3083,7 +3425,12 @@ bool UserManager::getAllUsers(QString &jsonData)
     }
 
     QSqlQuery q(db);
-    if (!q.exec("SELECT user_id, first_name, last_name, email, gender, birth_date, height, weight, Goal, StandardSubscription, PlanTrainning, COALESCE(kachballs,0) FROM USERS ORDER BY user_id")) {
+    if (!q.exec("SELECT user_id, first_name, last_name, email, gender, birth_date, height, weight, Goal, "
+                "StandardSubscription, PlanTrainning, COALESCE(kachballs,0), "
+                "COALESCE(VipSubscription, 0), COALESCE(subscription_frozen, 0), "
+                "COALESCE(FeedbackSubscription, 0), COALESCE(freeze_ends_at, ''), "
+                "COALESCE(freeze_count_year, 0) "
+                "FROM USERS ORDER BY user_id")) {
         qWarning() << "getAllUsers error:" << q.lastError().text();
         return false;
     }
@@ -3103,7 +3450,6 @@ bool UserManager::getAllUsers(QString &jsonData)
         obj["subscription"]  = q.value(9).toInt();
         int planId = q.value(10).toInt();
         obj["planTrainning"] = planId;
-        // Читаемое название плана
         QString pn = "Нет плана";
         if (planId == 1) pn = "Зал с нуля";
         else if (planId == 2) pn = "Зал любитель";
@@ -3113,6 +3459,11 @@ bool UserManager::getAllUsers(QString &jsonData)
         else if (planId == 7) pn = "Учимся подтягиваться";
         obj["planName"]      = pn;
         obj["kachballs"]     = q.value(11).toInt();
+        obj["vipSubscription"]      = q.value(12).toInt();
+        obj["frozen"]               = q.value(13).toInt();
+        obj["feedbackSubscription"] = q.value(14).toInt();
+        obj["freezeEndsAt"]         = q.value(15).toString();
+        obj["freezeCountYear"]      = q.value(16).toInt();
         arr.append(obj);
     }
 
@@ -3139,6 +3490,1040 @@ bool UserManager::setSubscription(int user_id, int status)
     }
 
     qDebug() << "setSubscription OK: user" << user_id << "status=" << status;
+    return true;
+}
+
+// ✅ Заморозить/разморозить подписку (1 = заморожена, 0 = активна).
+// Прогресс пользователя (тренировки, рацион, кач-баллы, VIP-программа) НЕ удаляется.
+bool UserManager::setSubscriptionFrozen(int user_id, int frozen)
+{
+    if (!db.isOpen()) {
+        qWarning() << "DB not open in setSubscriptionFrozen";
+        return false;
+    }
+
+    QSqlQuery q(db);
+    q.prepare("UPDATE USERS SET subscription_frozen = :f WHERE user_id = :uid");
+    q.bindValue(":f", frozen ? 1 : 0);
+    q.bindValue(":uid", user_id);
+
+    if (!q.exec()) {
+        qWarning() << "setSubscriptionFrozen error:" << q.lastError().text();
+        return false;
+    }
+    qDebug() << "setSubscriptionFrozen OK: user" << user_id << "frozen=" << frozen;
+    return true;
+}
+
+bool UserManager::getSubscriptionFrozen(int user_id, int &frozen)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    q.prepare("SELECT COALESCE(subscription_frozen, 0) FROM USERS WHERE user_id = :uid");
+    q.bindValue(":uid", user_id);
+    if (!q.exec() || !q.next()) return false;
+    frozen = q.value(0).toInt();
+    return true;
+}
+
+// ─── Заморозка с лимитом 2 раза в год и авто-разморозкой через days дней ───
+bool UserManager::freezeSubscription(int user_id, int days, QString &errorMessage)
+{
+    if (!db.isOpen()) { errorMessage = "DB not open"; return false; }
+
+    // Ограничения: 7–14 дней по ТЗ
+    if (days < 7) days = 7;
+    if (days > 14) days = 14;
+
+    const int currentYear = QDate::currentDate().year();
+
+    QSqlQuery sel(db);
+    sel.prepare("SELECT COALESCE(freeze_count_year,0), COALESCE(freeze_year,0), "
+                "COALESCE(subscription_frozen,0) FROM USERS WHERE user_id=:uid");
+    sel.bindValue(":uid", user_id);
+    if (!sel.exec() || !sel.next()) { errorMessage = "Пользователь не найден"; return false; }
+
+    int count = sel.value(0).toInt();
+    int year  = sel.value(1).toInt();
+    int already = sel.value(2).toInt();
+
+    if (already) { errorMessage = "Подписка уже заморожена"; return false; }
+
+    // Сброс счётчика при смене года
+    if (year != currentYear) { count = 0; year = currentYear; }
+
+    if (count >= 2) {
+        errorMessage = "Лимит заморозок исчерпан (2 раза в год)";
+        return false;
+    }
+
+    QString endsAt = QDateTime::currentDateTimeUtc().addDays(days).toString(Qt::ISODate);
+
+    QSqlQuery upd(db);
+    upd.prepare("UPDATE USERS SET subscription_frozen=1, freeze_ends_at=:ends, "
+                "freeze_count_year=:cnt, freeze_year=:yr WHERE user_id=:uid");
+    upd.bindValue(":ends", endsAt);
+    upd.bindValue(":cnt", count + 1);
+    upd.bindValue(":yr", year);
+    upd.bindValue(":uid", user_id);
+    if (!upd.exec()) { errorMessage = upd.lastError().text(); return false; }
+
+    qDebug() << "❄ Frozen user" << user_id << "until" << endsAt << "(count" << (count+1) << "/2)";
+    return true;
+}
+
+bool UserManager::unfreezeSubscription(int user_id)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    q.prepare("UPDATE USERS SET subscription_frozen=0, freeze_ends_at='' WHERE user_id=:uid");
+    q.bindValue(":uid", user_id);
+    if (!q.exec()) return false;
+    qDebug() << "☀ Unfrozen user" << user_id;
+    return true;
+}
+
+bool UserManager::getExpiredFreezes(QList<int> &userIds)
+{
+    userIds.clear();
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    QString now = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    q.prepare("SELECT user_id FROM USERS WHERE subscription_frozen=1 "
+              "AND freeze_ends_at != '' AND freeze_ends_at <= :now");
+    q.bindValue(":now", now);
+    if (!q.exec()) return false;
+    while (q.next()) userIds.append(q.value(0).toInt());
+    return true;
+}
+
+// ─── 3-й тариф: подписка с обратной связью ───
+bool UserManager::setFeedbackSubscription(int user_id, int status)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    q.prepare("UPDATE USERS SET FeedbackSubscription = :s WHERE user_id = :uid");
+    q.bindValue(":s", status ? 1 : 0);
+    q.bindValue(":uid", user_id);
+    if (!q.exec()) {
+        qWarning() << "setFeedbackSubscription error:" << q.lastError().text();
+        return false;
+    }
+    qDebug() << "Feedback subscription set:" << user_id << "=" << status;
+    return true;
+}
+
+bool UserManager::getFeedbackSubscription(int user_id, int &status)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    q.prepare("SELECT COALESCE(FeedbackSubscription, 0) FROM USERS WHERE user_id = :uid");
+    q.bindValue(":uid", user_id);
+    if (!q.exec() || !q.next()) return false;
+    status = q.value(0).toInt();
+    return true;
+}
+
+// ─── Авто-биллинг (рекуррентные платежи YooKassa) ────────────────────────
+// Здесь храним только метаданные (payment_method_id, дата следующего списания, retry).
+// Сам платёж делает сайт (Python/Flask), общаясь с YooKassa.
+// При неуспехе после 3 попыток ставим subscription_frozen=1 и freeze_reason='billing'.
+// Эта заморозка НЕ расходует пользовательскую квоту 2/год (она ведётся через freeze_count_year).
+
+bool UserManager::billingSaveMethod(int user_id,
+                                    const QString &paymentMethodId,
+                                    const QString &paymentMethodTitle,
+                                    const QString &tier,
+                                    int periodDays)
+{
+    if (!db.isOpen()) return false;
+    if (tier != "lite" && tier != "feedback") {
+        qWarning() << "billingSaveMethod: unsupported tier" << tier;
+        return false;
+    }
+    // Защита от попадания «мусорных» строк в БД: пустой payment_method_id
+    // ломает фильтр в billingGetDue() и приводит к попыткам списания с
+    // несуществующей карты в YooKassa.
+    if (paymentMethodId.trimmed().isEmpty()) {
+        qWarning() << "billingSaveMethod: paymentMethodId is empty for user" << user_id;
+        return false;
+    }
+
+    const QString nextDate =
+        QDateTime::currentDateTimeUtc().addDays(periodDays).toString(Qt::ISODate);
+
+    QSqlQuery q(db);
+    q.prepare(
+        "UPDATE USERS SET "
+        "  payment_method_id       = :pmid, "
+        "  payment_method_title    = :pmtitle, "
+        "  subscription_tier       = :tier, "
+        "  subscription_auto_renew = 1, "
+        "  next_billing_date       = :next, "
+        "  billing_retry_count     = 0, "
+        "  last_billing_attempt_at = :now, "
+        "  last_billing_status     = 'ok' "
+        "WHERE user_id = :uid");
+    q.bindValue(":pmid",    paymentMethodId);
+    q.bindValue(":pmtitle", paymentMethodTitle);
+    q.bindValue(":tier",    tier);
+    q.bindValue(":next",    nextDate);
+    q.bindValue(":now",     QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
+    q.bindValue(":uid",     user_id);
+    if (!q.exec()) {
+        qWarning() << "billingSaveMethod error:" << q.lastError().text();
+        return false;
+    }
+    qDebug() << "💳 Billing saved: user" << user_id
+             << "tier" << tier << "next" << nextDate;
+    return true;
+}
+
+bool UserManager::billingGetDue(QList<BillingDueRow> &rows)
+{
+    rows.clear();
+    if (!db.isOpen()) return false;
+
+    const QString now = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+
+    QSqlQuery q(db);
+    q.prepare(
+        "SELECT user_id, subscription_tier, payment_method_id, "
+        "       COALESCE(billing_retry_count, 0), "
+        "       COALESCE(email, ''), COALESCE(first_name, '') "
+        "FROM USERS "
+        "WHERE subscription_auto_renew = 1 "
+        "  AND payment_method_id != '' "
+        "  AND subscription_tier IN ('lite', 'feedback') "
+        "  AND COALESCE(VipSubscription, 0) = 0 "
+        "  AND next_billing_date != '' "
+        "  AND next_billing_date <= :now");
+    q.bindValue(":now", now);
+    if (!q.exec()) {
+        qWarning() << "billingGetDue error:" << q.lastError().text();
+        return false;
+    }
+    while (q.next()) {
+        BillingDueRow r;
+        r.userId          = q.value(0).toInt();
+        r.tier            = q.value(1).toString();
+        r.paymentMethodId = q.value(2).toString();
+        r.retryCount      = q.value(3).toInt();
+        r.email           = q.value(4).toString();
+        r.firstName       = q.value(5).toString();
+        rows.append(r);
+    }
+    return true;
+}
+
+bool UserManager::billingRecordSuccess(int user_id, int periodDays)
+{
+    if (!db.isOpen()) return false;
+
+    const QString next = QDateTime::currentDateTimeUtc().addDays(periodDays).toString(Qt::ISODate);
+    const QString now  = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+
+    QSqlQuery q(db);
+    // Если до этого была биллинг-заморозка — снимаем её.
+    // Ручную заморозку (freeze_reason='manual') НЕ трогаем.
+    q.prepare(
+        "UPDATE USERS SET "
+        "  next_billing_date        = :next, "
+        "  billing_retry_count      = 0, "
+        "  last_billing_attempt_at  = :now, "
+        "  last_billing_status      = 'ok', "
+        "  subscription_frozen      = CASE WHEN freeze_reason='billing' THEN 0 "
+        "                                  ELSE subscription_frozen END, "
+        "  freeze_ends_at           = CASE WHEN freeze_reason='billing' THEN '' "
+        "                                  ELSE freeze_ends_at END, "
+        "  freeze_reason            = CASE WHEN freeze_reason='billing' THEN '' "
+        "                                  ELSE freeze_reason END "
+        "WHERE user_id = :uid");
+    q.bindValue(":next", next);
+    q.bindValue(":now",  now);
+    q.bindValue(":uid",  user_id);
+    if (!q.exec()) {
+        qWarning() << "billingRecordSuccess error:" << q.lastError().text();
+        return false;
+    }
+    qDebug() << "✅ Billing success: user" << user_id << "next" << next;
+    return true;
+}
+
+bool UserManager::billingRecordFailure(int user_id, bool &outFrozen)
+{
+    outFrozen = false;
+    if (!db.isOpen()) return false;
+
+    // Получаем текущий retry_count
+    int retry = 0;
+    {
+        QSqlQuery sel(db);
+        sel.prepare("SELECT COALESCE(billing_retry_count, 0) FROM USERS WHERE user_id=:uid");
+        sel.bindValue(":uid", user_id);
+        if (!sel.exec() || !sel.next()) {
+            qWarning() << "billingRecordFailure: user not found" << user_id;
+            return false;
+        }
+        retry = sel.value(0).toInt();
+    }
+
+    // Если пользователь уже заморожен по биллингу после 3 неудач, повторные
+    // попытки больше не наращивают счётчик — оставляем 3, чтобы поле в БД не
+    // росло бесконечно и не путало диагностику.
+    if (retry >= 3) {
+        qDebug() << "billingRecordFailure: user" << user_id
+                 << "already at retry cap (3), no further increment";
+        outFrozen = true;
+        return true;
+    }
+
+    const int newRetry = retry + 1;
+    const QString now  = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+
+    if (newRetry >= 3) {
+        // Третья подряд неудача — морозим подписку (без квоты 2/год).
+        // Подписка-флаги (StandardSubscription/FeedbackSubscription) НЕ снимаем —
+        // данные пользователя сохраняются, доступ блокируется через subscription_frozen.
+        QSqlQuery upd(db);
+        upd.prepare(
+            "UPDATE USERS SET "
+            "  billing_retry_count     = :r, "
+            "  last_billing_attempt_at = :now, "
+            "  last_billing_status     = 'failed', "
+            "  subscription_frozen     = 1, "
+            "  freeze_reason           = 'billing', "
+            "  freeze_ends_at          = '' "
+            "WHERE user_id = :uid");
+        upd.bindValue(":r",   newRetry);
+        upd.bindValue(":now", now);
+        upd.bindValue(":uid", user_id);
+        if (!upd.exec()) {
+            qWarning() << "billingRecordFailure (freeze) error:" << upd.lastError().text();
+            return false;
+        }
+        outFrozen = true;
+        qDebug() << "❄ Billing FROZEN: user" << user_id << "after 3 failed attempts";
+        return true;
+    }
+
+    // Иначе — переносим next_billing_date: +1 / +3 / +5 дней.
+    int delayDays = 1;
+    if (newRetry == 1)      delayDays = 1;
+    else if (newRetry == 2) delayDays = 3;
+
+    const QString next = QDateTime::currentDateTimeUtc().addDays(delayDays).toString(Qt::ISODate);
+
+    QSqlQuery upd(db);
+    upd.prepare(
+        "UPDATE USERS SET "
+        "  billing_retry_count     = :r, "
+        "  next_billing_date       = :next, "
+        "  last_billing_attempt_at = :now, "
+        "  last_billing_status     = 'retry' "
+        "WHERE user_id = :uid");
+    upd.bindValue(":r",    newRetry);
+    upd.bindValue(":next", next);
+    upd.bindValue(":now",  now);
+    upd.bindValue(":uid",  user_id);
+    if (!upd.exec()) {
+        qWarning() << "billingRecordFailure (retry) error:" << upd.lastError().text();
+        return false;
+    }
+    qDebug() << "⚠ Billing retry" << newRetry << "for user" << user_id
+             << "next attempt" << next;
+    return true;
+}
+
+bool UserManager::billingCancelAutoRenew(int user_id)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    q.prepare(
+        "UPDATE USERS SET "
+        "  subscription_auto_renew = 0, "
+        "  next_billing_date       = '', "
+        "  billing_retry_count     = 0 "
+        "WHERE user_id = :uid");
+    q.bindValue(":uid", user_id);
+    if (!q.exec()) {
+        qWarning() << "billingCancelAutoRenew error:" << q.lastError().text();
+        return false;
+    }
+    qDebug() << "🛑 Auto-renew cancelled for user" << user_id;
+    return true;
+}
+
+bool UserManager::billingGetState(int user_id, QString &jsonData)
+{
+    if (!db.isOpen()) return false;
+
+    QSqlQuery q(db);
+    q.prepare(
+        "SELECT COALESCE(subscription_tier, ''), "
+        "       COALESCE(payment_method_title, ''), "
+        "       COALESCE(next_billing_date, ''), "
+        "       COALESCE(subscription_auto_renew, 0), "
+        "       COALESCE(subscription_frozen, 0), "
+        "       COALESCE(freeze_reason, ''), "
+        "       COALESCE(last_billing_status, ''), "
+        "       COALESCE(billing_retry_count, 0), "
+        "       COALESCE(StandardSubscription, 0), "
+        "       COALESCE(FeedbackSubscription, 0), "
+        "       COALESCE(VipSubscription, 0) "
+        "FROM USERS WHERE user_id = :uid");
+    q.bindValue(":uid", user_id);
+    if (!q.exec() || !q.next()) return false;
+
+    QJsonObject obj;
+    obj["tier"]                    = q.value(0).toString();
+    obj["payment_method_title"]    = q.value(1).toString();
+    obj["next_billing_date"]       = q.value(2).toString();
+    obj["auto_renew"]              = q.value(3).toInt() == 1;
+    obj["frozen"]                  = q.value(4).toInt() == 1;
+    obj["freeze_reason"]           = q.value(5).toString();
+    obj["last_billing_status"]     = q.value(6).toString();
+    obj["billing_retry_count"]     = q.value(7).toInt();
+    obj["standard_subscription"]   = q.value(8).toInt() == 1;
+    obj["feedback_subscription"]   = q.value(9).toInt() == 1;
+    obj["vip_subscription"]        = q.value(10).toInt() == 1;
+
+    jsonData = QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+    return true;
+}
+
+// ─── Чат ───
+bool UserManager::sendChatMessage(int user_id, bool fromAdmin, const QString &text, qint64 &messageId)
+{
+    if (!db.isOpen() || text.trimmed().isEmpty()) return false;
+    QSqlQuery q(db);
+    q.prepare("INSERT INTO Chat_Messages (user_id, from_admin, text, read_by_user, read_by_admin) "
+              "VALUES (:uid, :fa, :txt, :ru, :ra)");
+    q.bindValue(":uid", user_id);
+    q.bindValue(":fa", fromAdmin ? 1 : 0);
+    q.bindValue(":txt", text.left(4000));   // лимит длины сообщения
+    q.bindValue(":ru", fromAdmin ? 0 : 1);  // отправитель уже "прочитал"
+    q.bindValue(":ra", fromAdmin ? 1 : 0);
+    if (!q.exec()) {
+        qWarning() << "sendChatMessage error:" << q.lastError().text();
+        return false;
+    }
+    messageId = q.lastInsertId().toLongLong();
+    return true;
+}
+
+bool UserManager::loadChatHistory(int user_id, QString &jsonData)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    // ✅ Возвращаем createdAt как ISO 8601 с суффиксом 'Z' — чтобы JS на клиенте
+    //    однозначно парсил как UTC и корректно конвертировал в локальное время.
+    // hasPhoto = LENGTH(photo) > 0; сам бинарь не отдаём в истории, его
+    // подгружают отдельной командой GET_CHAT_PHOTO|message_id.
+    q.prepare("SELECT id, from_admin, text, "
+              "strftime('%Y-%m-%dT%H:%M:%SZ', created_at) AS created_at_iso, "
+              "read_by_user, read_by_admin, "
+              "CASE WHEN photo IS NOT NULL AND length(photo) > 0 THEN 1 ELSE 0 END AS has_photo "
+              "FROM Chat_Messages WHERE user_id=:uid ORDER BY id ASC LIMIT 500");
+    q.bindValue(":uid", user_id);
+    if (!q.exec()) return false;
+    QJsonArray arr;
+    while (q.next()) {
+        QJsonObject o;
+        o["id"]         = q.value(0).toInt();
+        o["fromAdmin"]  = q.value(1).toInt();
+        o["text"]       = q.value(2).toString();
+        o["createdAt"]  = q.value(3).toString();
+        o["readByUser"] = q.value(4).toInt();
+        o["readByAdmin"]= q.value(5).toInt();
+        o["hasPhoto"]   = q.value(6).toInt() == 1;
+        arr.append(o);
+    }
+    jsonData = QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+    return true;
+}
+
+// ─── Чат: фото-сообщения ──────────────────────────────────────────────────
+bool UserManager::sendChatPhoto(int user_id, bool fromAdmin,
+                                const QByteArray &photoData, qint64 &messageId)
+{
+    if (!db.isOpen() || photoData.isEmpty()) return false;
+    QSqlQuery q(db);
+    // text оставляем пустой — клиент рисует bubble как «фото».
+    // read-флаги ставятся как у обычного сообщения (отправитель уже видел).
+    q.prepare("INSERT INTO Chat_Messages (user_id, from_admin, text, photo, read_by_user, read_by_admin) "
+              "VALUES (:uid, :fa, '', :ph, :ru, :ra)");
+    q.bindValue(":uid", user_id);
+    q.bindValue(":fa", fromAdmin ? 1 : 0);
+    q.bindValue(":ph", photoData);
+    q.bindValue(":ru", fromAdmin ? 0 : 1);
+    q.bindValue(":ra", fromAdmin ? 1 : 0);
+    if (!q.exec()) {
+        qWarning() << "sendChatPhoto error:" << q.lastError().text();
+        return false;
+    }
+    messageId = q.lastInsertId().toLongLong();
+    qDebug() << "📷 Chat photo saved: user" << user_id
+             << "fromAdmin=" << fromAdmin
+             << "size=" << photoData.size() << "msgId=" << messageId;
+    return true;
+}
+
+bool UserManager::getChatPhoto(qint64 message_id, QByteArray &photoData)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    q.prepare("SELECT photo FROM Chat_Messages WHERE id=:mid");
+    q.bindValue(":mid", message_id);
+    if (!q.exec() || !q.next()) {
+        qWarning() << "getChatPhoto: message not found id=" << message_id;
+        return false;
+    }
+    photoData = q.value(0).toByteArray();
+    return !photoData.isEmpty();
+}
+
+bool UserManager::clearChatHistory(int user_id, int &deletedCount)
+{
+    deletedCount = 0;
+    if (!db.isOpen() || user_id <= 0) return false;
+    QSqlQuery q(db);
+    q.prepare("DELETE FROM Chat_Messages WHERE user_id = :uid");
+    q.bindValue(":uid", user_id);
+    if (!q.exec()) {
+        qWarning() << "clearChatHistory error:" << q.lastError().text();
+        return false;
+    }
+    deletedCount = q.numRowsAffected();
+    qDebug() << "🗑 Chat history cleared for user" << user_id
+             << "rows deleted:" << deletedCount;
+    return true;
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// ✅ Чат техподдержки — отдельная таблица Support_Messages.
+// Доступен ВСЕМ пользователям, не зависит от тарифа.
+// ═════════════════════════════════════════════════════════════════════
+
+bool UserManager::sendSupportMessage(int user_id, bool fromAdmin,
+                                     const QString &text, qint64 &messageId)
+{
+    if (!db.isOpen() || text.trimmed().isEmpty()) return false;
+    QSqlQuery q(db);
+    q.prepare("INSERT INTO Support_Messages (user_id, from_admin, text, read_by_user, read_by_admin) "
+              "VALUES (:uid, :fa, :txt, :ru, :ra)");
+    q.bindValue(":uid", user_id);
+    q.bindValue(":fa", fromAdmin ? 1 : 0);
+    q.bindValue(":txt", text.left(4000));
+    q.bindValue(":ru", fromAdmin ? 0 : 1);
+    q.bindValue(":ra", fromAdmin ? 1 : 0);
+    if (!q.exec()) {
+        qWarning() << "sendSupportMessage error:" << q.lastError().text();
+        return false;
+    }
+    messageId = q.lastInsertId().toLongLong();
+    return true;
+}
+
+bool UserManager::sendSupportPhoto(int user_id, bool fromAdmin,
+                                   const QByteArray &photoData, qint64 &messageId)
+{
+    if (!db.isOpen() || photoData.isEmpty()) return false;
+    QSqlQuery q(db);
+    q.prepare("INSERT INTO Support_Messages (user_id, from_admin, text, photo, read_by_user, read_by_admin) "
+              "VALUES (:uid, :fa, '', :ph, :ru, :ra)");
+    q.bindValue(":uid", user_id);
+    q.bindValue(":fa", fromAdmin ? 1 : 0);
+    q.bindValue(":ph", photoData);
+    q.bindValue(":ru", fromAdmin ? 0 : 1);
+    q.bindValue(":ra", fromAdmin ? 1 : 0);
+    if (!q.exec()) {
+        qWarning() << "sendSupportPhoto error:" << q.lastError().text();
+        return false;
+    }
+    messageId = q.lastInsertId().toLongLong();
+    return true;
+}
+
+bool UserManager::getSupportPhoto(qint64 message_id, QByteArray &photoData)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    q.prepare("SELECT photo FROM Support_Messages WHERE id = :mid");
+    q.bindValue(":mid", message_id);
+    if (!q.exec() || !q.next()) return false;
+    photoData = q.value(0).toByteArray();
+    return !photoData.isEmpty();
+}
+
+bool UserManager::loadSupportHistory(int user_id, QString &jsonData)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    q.prepare("SELECT id, from_admin, text, "
+              "strftime('%Y-%m-%dT%H:%M:%SZ', created_at) AS created_at_iso, "
+              "read_by_user, read_by_admin, "
+              "CASE WHEN photo IS NOT NULL AND length(photo) > 0 THEN 1 ELSE 0 END AS has_photo "
+              "FROM Support_Messages WHERE user_id = :uid ORDER BY id ASC LIMIT 500");
+    q.bindValue(":uid", user_id);
+    if (!q.exec()) return false;
+    QJsonArray arr;
+    while (q.next()) {
+        QJsonObject o;
+        o["id"]         = q.value(0).toInt();
+        o["fromAdmin"]  = q.value(1).toInt();
+        o["text"]       = q.value(2).toString();
+        o["createdAt"]  = q.value(3).toString();
+        o["readByUser"] = q.value(4).toInt();
+        o["readByAdmin"]= q.value(5).toInt();
+        o["hasPhoto"]   = q.value(6).toInt() == 1;
+        arr.append(o);
+    }
+    jsonData = QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+    return true;
+}
+
+bool UserManager::markSupportRead(int user_id, bool byAdmin)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    if (byAdmin) {
+        q.prepare("UPDATE Support_Messages SET read_by_admin = 1 "
+                  "WHERE user_id = :uid AND from_admin = 0");
+    } else {
+        q.prepare("UPDATE Support_Messages SET read_by_user = 1 "
+                  "WHERE user_id = :uid AND from_admin = 1");
+    }
+    q.bindValue(":uid", user_id);
+    return q.exec();
+}
+
+bool UserManager::countSupportUnreadForUser(int user_id, int &count)
+{
+    count = 0;
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    q.prepare("SELECT COUNT(*) FROM Support_Messages "
+              "WHERE user_id = :uid AND from_admin = 1 AND read_by_user = 0");
+    q.bindValue(":uid", user_id);
+    if (!q.exec() || !q.next()) return false;
+    count = q.value(0).toInt();
+    return true;
+}
+
+bool UserManager::getAdminSupportConversations(QString &jsonData)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    q.prepare(
+        "SELECT u.user_id, u.first_name, u.last_name, "
+        "  (SELECT text FROM Support_Messages sm WHERE sm.user_id = u.user_id ORDER BY sm.id DESC LIMIT 1) AS last_text, "
+        "  (SELECT strftime('%Y-%m-%dT%H:%M:%SZ', created_at) FROM Support_Messages sm WHERE sm.user_id = u.user_id ORDER BY sm.id DESC LIMIT 1) AS last_at, "
+        "  (SELECT COUNT(*) FROM Support_Messages sm WHERE sm.user_id = u.user_id AND sm.from_admin = 0 AND sm.read_by_admin = 0) AS unread "
+        "FROM USERS u "
+        "WHERE EXISTS (SELECT 1 FROM Support_Messages sm WHERE sm.user_id = u.user_id) "
+        "ORDER BY last_at DESC");
+    if (!q.exec()) return false;
+    QJsonArray arr;
+    while (q.next()) {
+        QJsonObject o;
+        o["user_id"]    = q.value(0).toInt();
+        o["first_name"] = q.value(1).toString();
+        o["last_name"]  = q.value(2).toString();
+        o["last_text"]  = q.value(3).toString();
+        o["last_at"]    = q.value(4).toString();
+        o["unread"]     = q.value(5).toInt();
+        arr.append(o);
+    }
+    jsonData = QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+    return true;
+}
+
+bool UserManager::clearSupportHistory(int user_id, int &deletedCount)
+{
+    deletedCount = 0;
+    if (!db.isOpen() || user_id <= 0) return false;
+    QSqlQuery q(db);
+    q.prepare("DELETE FROM Support_Messages WHERE user_id = :uid");
+    q.bindValue(":uid", user_id);
+    if (!q.exec()) return false;
+    deletedCount = q.numRowsAffected();
+    return true;
+}
+
+bool UserManager::markChatRead(int user_id, bool byAdmin)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    if (byAdmin) {
+        q.prepare("UPDATE Chat_Messages SET read_by_admin=1 WHERE user_id=:uid AND from_admin=0");
+    } else {
+        q.prepare("UPDATE Chat_Messages SET read_by_user=1 WHERE user_id=:uid AND from_admin=1");
+    }
+    q.bindValue(":uid", user_id);
+    return q.exec();
+}
+
+bool UserManager::getAdminConversations(QString &jsonData)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    if (!q.exec(
+            "SELECT u.user_id, u.first_name, u.last_name, "
+            "  (SELECT text FROM Chat_Messages cm WHERE cm.user_id=u.user_id ORDER BY cm.id DESC LIMIT 1) AS last_text, "
+            "  (SELECT strftime('%Y-%m-%dT%H:%M:%SZ', created_at) FROM Chat_Messages cm WHERE cm.user_id=u.user_id ORDER BY cm.id DESC LIMIT 1) AS last_at, "
+            "  (SELECT COUNT(*) FROM Chat_Messages cm WHERE cm.user_id=u.user_id AND cm.from_admin=0 AND cm.read_by_admin=0) AS unread "
+            "FROM USERS u "
+            "WHERE EXISTS (SELECT 1 FROM Chat_Messages cm WHERE cm.user_id=u.user_id) "
+            "ORDER BY last_at DESC")) {
+        qWarning() << "getAdminConversations error:" << q.lastError().text();
+        return false;
+    }
+    QJsonArray arr;
+    while (q.next()) {
+        QJsonObject o;
+        o["user_id"]    = q.value(0).toInt();
+        o["first_name"] = q.value(1).toString();
+        o["last_name"]  = q.value(2).toString();
+        o["last_text"]  = q.value(3).toString();
+        o["last_at"]    = q.value(4).toString();
+        o["unread"]     = q.value(5).toInt();
+        arr.append(o);
+    }
+    jsonData = QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+    return true;
+}
+
+bool UserManager::countUnreadForUser(int user_id, int &count)
+{
+    count = 0;
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    q.prepare("SELECT COUNT(*) FROM Chat_Messages WHERE user_id=:uid AND from_admin=1 AND read_by_user=0");
+    q.bindValue(":uid", user_id);
+    if (!q.exec() || !q.next()) return false;
+    count = q.value(0).toInt();
+    return true;
+}
+
+// ─── Приготовленные блюда (фото → баллы) ───
+bool UserManager::saveCookedDish(int user_id, int recipe_id, const QByteArray &photoData, int &dishId)
+{
+    if (!db.isOpen() || photoData.isEmpty()) return false;
+    QSqlQuery q(db);
+    q.prepare("INSERT INTO Cooked_Dishes (user_id, recipe_id, photo) VALUES (:uid, :rid, :p)");
+    q.bindValue(":uid", user_id);
+    q.bindValue(":rid", recipe_id > 0 ? recipe_id : QVariant(QMetaType(QMetaType::Int)));
+    q.bindValue(":p", photoData);
+    if (!q.exec()) {
+        qWarning() << "saveCookedDish error:" << q.lastError().text();
+        return false;
+    }
+    dishId = q.lastInsertId().toInt();
+    // Сумма редактируется через админ-панель (Bonus_Settings.cooked_dish)
+    addKachballs(user_id, getBonusAmount("cooked_dish", 5));
+    return true;
+}
+
+bool UserManager::loadCookedDishes(int user_id, QString &jsonData)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    q.prepare("SELECT id, recipe_id, created_at, approved FROM Cooked_Dishes WHERE user_id=:uid "
+              "ORDER BY id DESC LIMIT 100");
+    q.bindValue(":uid", user_id);
+    if (!q.exec()) return false;
+    QJsonArray arr;
+    while (q.next()) {
+        QJsonObject o;
+        o["id"]        = q.value(0).toInt();
+        o["recipe_id"] = q.value(1).toInt();
+        o["createdAt"] = q.value(2).toString();
+        o["approved"]  = q.value(3).toInt();
+        arr.append(o);
+    }
+    jsonData = QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+    return true;
+}
+
+bool UserManager::getCookedDishPhoto(int dish_id, QByteArray &photoData)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    q.prepare("SELECT photo FROM Cooked_Dishes WHERE id=:id");
+    q.bindValue(":id", dish_id);
+    if (!q.exec() || !q.next()) return false;
+    photoData = q.value(0).toByteArray();
+    return !photoData.isEmpty();
+}
+
+// ─── Просмотренные уроки ───
+bool UserManager::markLessonViewed(int user_id, const QString &lessonKey, int &awardedBalls)
+{
+    awardedBalls = 0;
+    if (!db.isOpen() || lessonKey.trimmed().isEmpty()) return false;
+
+    QSqlQuery chk(db);
+    chk.prepare("SELECT 1 FROM User_Lessons_Viewed WHERE user_id=:uid AND lesson_key=:k");
+    chk.bindValue(":uid", user_id);
+    chk.bindValue(":k", lessonKey);
+    if (chk.exec() && chk.next()) {
+        return true;   // уже просмотрен — баллы не повторяются
+    }
+
+    QSqlQuery ins(db);
+    ins.prepare("INSERT INTO User_Lessons_Viewed (user_id, lesson_key) VALUES (:uid, :k)");
+    ins.bindValue(":uid", user_id);
+    ins.bindValue(":k", lessonKey);
+    if (!ins.exec()) {
+        qWarning() << "markLessonViewed error:" << ins.lastError().text();
+        return false;
+    }
+    // Сумма редактируется через админ-панель (Bonus_Settings.lesson_viewed)
+    awardedBalls = getBonusAmount("lesson_viewed", 3);
+    addKachballs(user_id, awardedBalls);
+    return true;
+}
+
+bool UserManager::loadViewedLessons(int user_id, QString &jsonData)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    q.prepare("SELECT lesson_key, viewed_at FROM User_Lessons_Viewed WHERE user_id=:uid");
+    q.bindValue(":uid", user_id);
+    if (!q.exec()) return false;
+    QJsonArray arr;
+    while (q.next()) {
+        QJsonObject o;
+        o["lesson_key"] = q.value(0).toString();
+        o["viewed_at"]  = q.value(1).toString();
+        arr.append(o);
+    }
+    jsonData = QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+    return true;
+}
+
+// ─── Избранные рецепты ───
+bool UserManager::addFavoriteRecipe(int user_id, int recipe_id)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    q.prepare("INSERT OR IGNORE INTO User_Favorite_Recipes (user_id, recipe_id) VALUES (:uid, :rid)");
+    q.bindValue(":uid", user_id);
+    q.bindValue(":rid", recipe_id);
+    return q.exec();
+}
+
+bool UserManager::removeFavoriteRecipe(int user_id, int recipe_id)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    q.prepare("DELETE FROM User_Favorite_Recipes WHERE user_id=:uid AND recipe_id=:rid");
+    q.bindValue(":uid", user_id);
+    q.bindValue(":rid", recipe_id);
+    return q.exec();
+}
+
+bool UserManager::loadFavoriteRecipes(int user_id, QString &jsonData)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    q.prepare("SELECT recipe_id FROM User_Favorite_Recipes WHERE user_id=:uid");
+    q.bindValue(":uid", user_id);
+    if (!q.exec()) return false;
+    QJsonArray arr;
+    while (q.next()) arr.append(q.value(0).toInt());
+    jsonData = QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+    return true;
+}
+
+// ─── Регистрация push-устройств ───
+bool UserManager::registerDevice(int user_id, const QString &token, const QString &platform)
+{
+    if (!db.isOpen() || token.isEmpty()) return false;
+    QSqlQuery q(db);
+    q.prepare("INSERT OR REPLACE INTO User_Devices (user_id, device_token, platform, last_seen) "
+              "VALUES (:uid, :t, :p, datetime('now'))");
+    q.bindValue(":uid", user_id);
+    q.bindValue(":t", token);
+    q.bindValue(":p", platform);
+    return q.exec();
+}
+
+bool UserManager::unregisterDevice(int user_id, const QString &token)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    q.prepare("DELETE FROM User_Devices WHERE user_id=:uid AND device_token=:t");
+    q.bindValue(":uid", user_id);
+    q.bindValue(":t", token);
+    return q.exec();
+}
+
+bool UserManager::loadUserDevices(int user_id, QString &jsonData)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    q.prepare("SELECT device_token, platform, last_seen FROM User_Devices WHERE user_id=:uid");
+    q.bindValue(":uid", user_id);
+    if (!q.exec()) return false;
+    QJsonArray arr;
+    while (q.next()) {
+        QJsonObject o;
+        o["token"]     = q.value(0).toString();
+        o["platform"]  = q.value(1).toString();
+        o["last_seen"] = q.value(2).toString();
+        arr.append(o);
+    }
+    jsonData = QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+    return true;
+}
+
+bool UserManager::loadAllDevices(QString &jsonData)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    // INNER JOIN — отсекаем «осиротевшие» записи устройств для удалённых
+    // пользователей (LEFT JOIN их пропускал, и сайт-cron пытался для них
+    // делать платежи / слать пуши на несуществующих юзеров).
+    q.prepare(
+        "SELECT d.user_id, COALESCE(u.first_name, ''), d.device_token, d.platform "
+        "FROM User_Devices d "
+        "INNER JOIN USERS u ON u.user_id = d.user_id");
+    if (!q.exec()) {
+        qWarning() << "loadAllDevices error:" << q.lastError().text();
+        return false;
+    }
+    QJsonArray arr;
+    while (q.next()) {
+        QJsonObject o;
+        o["user_id"]    = q.value(0).toInt();
+        o["first_name"] = q.value(1).toString();
+        o["token"]      = q.value(2).toString();
+        o["platform"]   = q.value(3).toString();
+        arr.append(o);
+    }
+    jsonData = QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+    return true;
+}
+
+bool UserManager::removeDeviceByToken(const QString &token)
+{
+    if (!db.isOpen() || token.isEmpty()) return false;
+    QSqlQuery q(db);
+    q.prepare("DELETE FROM User_Devices WHERE device_token = :t");
+    q.bindValue(":t", token);
+    if (!q.exec()) {
+        qWarning() << "removeDeviceByToken error:" << q.lastError().text();
+        return false;
+    }
+    qDebug() << "🗑 Device unregistered (invalid token):" << token.left(12) << "…";
+    return true;
+}
+
+bool UserManager::addKachballs(int user_id, int amount)
+{
+    if (!db.isOpen() || amount == 0) return false;
+    QSqlQuery q(db);
+    q.prepare("UPDATE USERS SET kachballs = COALESCE(kachballs,0) + :a WHERE user_id=:uid");
+    q.bindValue(":a", amount);
+    q.bindValue(":uid", user_id);
+    return q.exec();
+}
+
+// ── Настройки призовых баллов ──────────────────────────────────────────────
+int UserManager::getBonusAmount(const QString &key, int defaultAmount)
+{
+    if (!db.isOpen()) return defaultAmount;
+    QSqlQuery q(db);
+    q.prepare("SELECT amount FROM Bonus_Settings WHERE key=:k");
+    q.bindValue(":k", key);
+    if (!q.exec() || !q.next()) return defaultAmount;
+    return q.value(0).toInt();
+}
+
+bool UserManager::setBonusAmount(const QString &key, int amount)
+{
+    if (!db.isOpen() || key.isEmpty() || amount < 0) return false;
+    QSqlQuery q(db);
+    q.prepare("UPDATE Bonus_Settings SET amount=:a WHERE key=:k");
+    q.bindValue(":a", amount);
+    q.bindValue(":k", key);
+    if (!q.exec()) {
+        qWarning() << "setBonusAmount error:" << q.lastError().text();
+        return false;
+    }
+    if (q.numRowsAffected() == 0) {
+        // ключа нет — вставляем
+        QSqlQuery ins(db);
+        ins.prepare("INSERT INTO Bonus_Settings (key, amount, description) VALUES (:k, :a, '')");
+        ins.bindValue(":k", key);
+        ins.bindValue(":a", amount);
+        if (!ins.exec()) {
+            qWarning() << "setBonusAmount insert error:" << ins.lastError().text();
+            return false;
+        }
+    }
+    return true;
+}
+
+bool UserManager::getAllBonusSettings(QString &jsonData)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    if (!q.exec("SELECT key, amount, description FROM Bonus_Settings ORDER BY key")) {
+        qWarning() << "getAllBonusSettings error:" << q.lastError().text();
+        return false;
+    }
+    QJsonArray arr;
+    while (q.next()) {
+        QJsonObject o;
+        o["key"]         = q.value(0).toString();
+        o["amount"]      = q.value(1).toInt();
+        o["description"] = q.value(2).toString();
+        arr.append(o);
+    }
+    jsonData = QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+    return true;
+}
+
+// Награда за уникальное (за день) блюдо в рационе. Возвращает true, если запрос
+// корректно обработан. kachballs_awarded = 0, если этот рецепт уже учитывался сегодня.
+bool UserManager::addDishToDiet(int user_id, const QString &recipe_name,
+                                const QString &date, int &kachballs_awarded)
+{
+    kachballs_awarded = 0;
+    if (!db.isOpen() || user_id <= 0 || recipe_name.trimmed().isEmpty() || date.isEmpty())
+        return false;
+
+    QSqlQuery chk(db);
+    chk.prepare("SELECT 1 FROM Diet_Reward_Log "
+                "WHERE user_id=:uid AND date=:d AND recipe_name=:n");
+    chk.bindValue(":uid", user_id);
+    chk.bindValue(":d",   date);
+    chk.bindValue(":n",   recipe_name);
+    if (chk.exec() && chk.next()) {
+        // уже начисляли за это блюдо сегодня — не повторяем
+        return true;
+    }
+
+    QSqlQuery ins(db);
+    ins.prepare("INSERT INTO Diet_Reward_Log (user_id, date, recipe_name) "
+                "VALUES (:uid, :d, :n)");
+    ins.bindValue(":uid", user_id);
+    ins.bindValue(":d",   date);
+    ins.bindValue(":n",   recipe_name);
+    if (!ins.exec()) {
+        qWarning() << "addDishToDiet insert error:" << ins.lastError().text();
+        return false;
+    }
+
+    int reward = getBonusAmount("dish_added", 5);
+    if (reward > 0 && addKachballs(user_id, reward)) {
+        kachballs_awarded = reward;
+        qDebug() << "💰 Diet dish reward +" << reward << "for user" << user_id
+                 << "recipe:" << recipe_name;
+    }
     return true;
 }
 
@@ -4444,4 +5829,240 @@ bool UserManager::resetGamification()
     }
     qDebug() << "resetGamification OK";
     return true;
+}
+
+// ==============================================================================
+// АДМИН: УПРАВЛЕНИЕ НАГРАДАМИ ЗА ДОСТИЖЕНИЯ
+// ==============================================================================
+
+bool UserManager::getAllAchievements(QString &jsonData)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    if (!q.exec("SELECT id, key, name, description, category, reward, threshold FROM Achievements ORDER BY id")) {
+        qWarning() << "getAllAchievements error:" << q.lastError().text();
+        return false;
+    }
+    QJsonArray arr;
+    while (q.next()) {
+        QJsonObject obj;
+        obj["id"]          = q.value(0).toInt();
+        obj["key"]         = q.value(1).toString();
+        obj["name"]        = q.value(2).toString();
+        obj["description"] = q.value(3).toString();
+        obj["category"]    = q.value(4).toString();
+        obj["reward"]      = q.value(5).toInt();
+        obj["threshold"]   = q.value(6).toInt();
+        arr.append(obj);
+    }
+    jsonData = QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+    qDebug() << "getAllAchievements OK:" << arr.size() << "entries";
+    return true;
+}
+
+bool UserManager::updateAchievementReward(int achievementId, int newReward)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    q.prepare("UPDATE Achievements SET reward = :reward WHERE id = :id");
+    q.bindValue(":reward", newReward);
+    q.bindValue(":id", achievementId);
+    if (!q.exec()) {
+        qWarning() << "updateAchievementReward error:" << q.lastError().text();
+        return false;
+    }
+    qDebug() << "updateAchievementReward OK: id=" << achievementId << "reward=" << newReward;
+    return true;
+}
+
+// ==============================================================================
+// VIP ПЕРСОНАЛЬНЫЕ ПРОГРАММЫ
+// ==============================================================================
+
+bool UserManager::setVipSubscription(int user_id, int status)
+{
+    if (!db.isOpen()) {
+        qWarning() << "DB not open in setVipSubscription";
+        return false;
+    }
+
+    QSqlQuery q(db);
+    q.prepare("UPDATE USERS SET VipSubscription = :status WHERE user_id = :uid");
+    q.bindValue(":status", status);
+    q.bindValue(":uid", user_id);
+
+    if (!q.exec()) {
+        qWarning() << "setVipSubscription error:" << q.lastError().text();
+        return false;
+    }
+
+    // If disabling VIP — clear program and weights
+    if (status == 0) {
+        deleteVipProgram(user_id);
+        clearVipExerciseWeights(user_id);
+        resetWorkoutProgress(user_id);
+        clearWorkoutStats(user_id);
+    }
+
+    qDebug() << "setVipSubscription OK: user" << user_id << "status=" << status;
+    return true;
+}
+
+bool UserManager::getVipSubscription(int user_id, int &status)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    q.prepare("SELECT COALESCE(VipSubscription, 0) FROM USERS WHERE user_id = :uid");
+    q.bindValue(":uid", user_id);
+    if (!q.exec() || !q.next()) {
+        status = 0;
+        return false;
+    }
+    status = q.value(0).toInt();
+    return true;
+}
+
+bool UserManager::createVipProgram(int user_id, const QString &programName,
+                                   const QString &workout1Json, const QString &workout2Json,
+                                   const QString &workout3Json)
+{
+    if (!db.isOpen()) return false;
+
+    QString now = QDateTime::currentDateTime().toString(Qt::ISODate);
+
+    // Delete existing if any
+    QSqlQuery del(db);
+    del.prepare("DELETE FROM Vip_Programs WHERE user_id = :uid");
+    del.bindValue(":uid", user_id);
+    del.exec();
+
+    // Insert new
+    QSqlQuery q(db);
+    q.prepare("INSERT INTO Vip_Programs (user_id, program_name, workout1_json, workout2_json, workout3_json, created_at) "
+              "VALUES (:uid, :name, :w1, :w2, :w3, :date)");
+    q.bindValue(":uid", user_id);
+    q.bindValue(":name", programName);
+    q.bindValue(":w1", workout1Json);
+    q.bindValue(":w2", workout2Json);
+    q.bindValue(":w3", workout3Json);
+    q.bindValue(":date", now);
+
+    if (!q.exec()) {
+        qWarning() << "createVipProgram error:" << q.lastError().text();
+        return false;
+    }
+
+    // Reset workout progress for fresh start
+    resetWorkoutProgress(user_id);
+    clearVipExerciseWeights(user_id);
+    clearWorkoutStats(user_id);
+
+    qDebug() << "createVipProgram OK: user" << user_id << "program:" << programName;
+    return true;
+}
+
+bool UserManager::loadVipProgram(int user_id, QString &jsonData)
+{
+    if (!db.isOpen()) return false;
+
+    QSqlQuery q(db);
+    q.prepare("SELECT program_name, workout1_json, workout2_json, workout3_json, created_at "
+              "FROM Vip_Programs WHERE user_id = :uid");
+    q.bindValue(":uid", user_id);
+
+    if (!q.exec()) {
+        qWarning() << "loadVipProgram error:" << q.lastError().text();
+        return false;
+    }
+
+    if (!q.next()) {
+        jsonData = "{}";
+        return false;
+    }
+
+    QJsonObject obj;
+    obj["program_name"] = q.value(0).toString();
+    obj["workout1"] = QJsonDocument::fromJson(q.value(1).toString().toUtf8()).array();
+    obj["workout2"] = QJsonDocument::fromJson(q.value(2).toString().toUtf8()).array();
+    obj["workout3"] = QJsonDocument::fromJson(q.value(3).toString().toUtf8()).array();
+    obj["created_at"] = q.value(4).toString();
+
+    jsonData = QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+    qDebug() << "loadVipProgram OK: user" << user_id;
+    return true;
+}
+
+bool UserManager::deleteVipProgram(int user_id)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    q.prepare("DELETE FROM Vip_Programs WHERE user_id = :uid");
+    q.bindValue(":uid", user_id);
+    bool ok = q.exec();
+    qDebug() << "deleteVipProgram:" << (ok ? "OK" : "FAILED") << "user=" << user_id;
+    return ok;
+}
+
+bool UserManager::clearVipExerciseWeights(int user_id)
+{
+    if (!db.isOpen()) return false;
+    QSqlQuery q(db);
+    q.prepare("DELETE FROM Vip_Exercise_Weights WHERE user_id = :uid");
+    q.bindValue(":uid", user_id);
+    bool ok = q.exec();
+    qDebug() << "clearVipExerciseWeights:" << (ok ? "OK" : "FAILED") << "user=" << user_id;
+    return ok;
+}
+
+bool UserManager::saveVipExerciseWeight(int user_id, const QString &exerciseName, float a1, float a2, float a3)
+{
+    if (!db.isOpen()) return false;
+
+    QSqlQuery q(db);
+    q.prepare("SELECT id FROM Vip_Exercise_Weights WHERE user_id=:uid AND exercise_name=:name");
+    q.bindValue(":uid", user_id);
+    q.bindValue(":name", exerciseName);
+    q.exec();
+
+    if (q.next()) {
+        QSqlQuery upd(db);
+        upd.prepare("UPDATE Vip_Exercise_Weights SET approach1=:a1, approach2=:a2, approach3=:a3 "
+                    "WHERE user_id=:uid AND exercise_name=:name");
+        upd.bindValue(":a1", a1);
+        upd.bindValue(":a2", a2);
+        upd.bindValue(":a3", a3);
+        upd.bindValue(":uid", user_id);
+        upd.bindValue(":name", exerciseName);
+        return upd.exec();
+    }
+
+    QSqlQuery ins(db);
+    ins.prepare("INSERT INTO Vip_Exercise_Weights (user_id, exercise_name, approach1, approach2, approach3) "
+                "VALUES (:uid, :name, :a1, :a2, :a3)");
+    ins.bindValue(":uid", user_id);
+    ins.bindValue(":name", exerciseName);
+    ins.bindValue(":a1", a1);
+    ins.bindValue(":a2", a2);
+    ins.bindValue(":a3", a3);
+    return ins.exec();
+}
+
+bool UserManager::loadVipExerciseWeight(int user_id, const QString &exerciseName, float &a1, float &a2, float &a3)
+{
+    if (!db.isOpen()) return false;
+
+    QSqlQuery q(db);
+    q.prepare("SELECT approach1, approach2, approach3 FROM Vip_Exercise_Weights "
+              "WHERE user_id=:uid AND exercise_name=:name");
+    q.bindValue(":uid", user_id);
+    q.bindValue(":name", exerciseName);
+
+    if (q.exec() && q.next()) {
+        a1 = q.value(0).toFloat();
+        a2 = q.value(1).toFloat();
+        a3 = q.value(2).toFloat();
+        return true;
+    }
+    a1 = a2 = a3 = 0;
+    return false;
 }

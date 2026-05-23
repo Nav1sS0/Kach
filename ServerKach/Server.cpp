@@ -4,16 +4,20 @@
 #include <QBuffer>
 #include <QDate>
 #include <QDateTime>
+#include <QSettings>
+#include <QCryptographicHash>
+#include <QCoreApplication>
+#include <QDir>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 
 Server::Server(QObject *parent)
     : QTcpServer(parent),
+    inactivityCheckTimer(nullptr),
+    freezeCheckTimer(nullptr),
     requireSize(0),
-    comlexData(false),
-    expectedImageSize(0),
-    currentImageUserId(-1),
-    isReceivingImage(false),
-    currentMeasurementId(-1),
-    inactivityCheckTimer(nullptr)
+    comlexData(false)
 {
     if (this->listen(QHostAddress::Any, 2323)) {
         qDebug() << "=== Server started on port 2323 ===";
@@ -21,11 +25,18 @@ Server::Server(QObject *parent)
         qDebug() << "=== Server error: " << this->errorString() << " ===";
     }
 
-    // ✅ Запускаем таймер проверки неактивных соединений
+    // ✅ Таймер проверки неактивных соединений
     inactivityCheckTimer = new QTimer(this);
     connect(inactivityCheckTimer, &QTimer::timeout, this, &Server::checkInactiveConnections);
-    inactivityCheckTimer->start(5000);  // Проверяем каждые 5 секунд
-    qDebug() << "DDoS Protection: Inactivity checker started";
+    inactivityCheckTimer->start(5000);
+
+    // ✅ Таймер авто-разморозки подписок (раз в час)
+    freezeCheckTimer = new QTimer(this);
+    connect(freezeCheckTimer, &QTimer::timeout, this, &Server::checkExpiredFreezes);
+    freezeCheckTimer->start(3600 * 1000);
+    QTimer::singleShot(2000, this, &Server::checkExpiredFreezes);  // прогон сразу после старта
+
+    qDebug() << "DDoS Protection + auto-unfreeze timers started";
 }
 
 Server::~Server()
@@ -33,12 +44,21 @@ Server::~Server()
     if (inactivityCheckTimer) {
         inactivityCheckTimer->stop();
         inactivityCheckTimer->deleteLater();
+        inactivityCheckTimer = nullptr;
+    }
+    if (freezeCheckTimer) {
+        freezeCheckTimer->stop();
+        freezeCheckTimer->deleteLater();
+        freezeCheckTimer = nullptr;
     }
 
+    // ✅ Безопасное завершение: отсоединяем сигналы перед удалением (избегаем
+    // повторного вызова removeSocket из деструктора)
     for(auto& socketInfo : Sockets) {
         if(socketInfo.socket) {
+            QObject::disconnect(socketInfo.socket, nullptr, this, nullptr);
             socketInfo.socket->disconnectFromHost();
-            delete socketInfo.socket;
+            socketInfo.socket->deleteLater();
         }
     }
     Sockets.clear();
@@ -104,15 +124,20 @@ void Server::incomingConnection(qintptr socketDescriptor)
 
 void Server::removeSocket()
 {
+    QTcpSocket* socket = qobject_cast<QTcpSocket*>(sender());
+    if (!socket) return;
+
     for(int i = Sockets.size() - 1; i >= 0; i--) {
-        if(Sockets[i].socket == sender()) {
+        if(Sockets[i].socket == socket) {
             QString clientIp = Sockets[i].clientIp;
 
             // Уменьшаем счетчик для этого IP
-            ipConnectionCount[clientIp]--;
-            if (ipConnectionCount[clientIp] <= 0) {
-                ipConnectionCount.remove(clientIp);
-                ipPacketTimestamps.remove(clientIp);
+            if (ipConnectionCount.contains(clientIp)) {
+                ipConnectionCount[clientIp]--;
+                if (ipConnectionCount[clientIp] <= 0) {
+                    ipConnectionCount.remove(clientIp);
+                    ipPacketTimestamps.remove(clientIp);
+                }
             }
 
             Sockets.removeAt(i);
@@ -120,12 +145,41 @@ void Server::removeSocket()
         }
     }
 
-    QTcpSocket* socket = dynamic_cast<QTcpSocket*>(sender());
-    if(socket) {
-        delete socket;
-    }
+    // ✅ Используем deleteLater() — мы внутри слота, вызванного сигналом этого сокета.
+    // delete привёл бы к use-after-free.
+    socket->deleteLater();
 
     qDebug() << "Client disconnected. Total clients:" << Sockets.size();
+}
+
+// ✅ Helper: требует валидную авторизацию пользователя
+bool Server::requireAuth(QTcpSocket* sock, const SocketInfo& info, const QString& cmdName)
+{
+    if (!info.authenticated || info.userId <= 0) {
+        qWarning() << "🚫 Unauthorized command attempt:" << cmdName << "from IP:" << info.clientIp;
+        SendToClient(sock, "UNAUTHORIZED");
+        return false;
+    }
+    return true;
+}
+
+// ✅ Helper: проверяет, что requestedUserId совпадает с авторизованным userId
+// (защита от IDOR — попыток обратиться к чужим данным)
+bool Server::requireOwnership(QTcpSocket* sock, const SocketInfo& info, int requestedUserId, const QString& cmdName)
+{
+    if (!info.authenticated || info.userId <= 0) {
+        qWarning() << "🚫 Unauthorized ownership check:" << cmdName << "from IP:" << info.clientIp;
+        SendToClient(sock, "UNAUTHORIZED");
+        return false;
+    }
+    if (info.userId != requestedUserId) {
+        qWarning() << "🚫 IDOR attempt:" << cmdName
+                   << "by user" << info.userId << "tried to access user" << requestedUserId
+                   << "from IP:" << info.clientIp;
+        SendToClient(sock, "FORBIDDEN");
+        return false;
+    }
+    return true;
 }
 
 bool Server::isRateLimited(const QString& clientIp)
@@ -179,6 +233,22 @@ void Server::checkInactiveConnections()
         if (idx >= 0 && idx < Sockets.size()) {
             if (Sockets[idx].socket) {
                 Sockets[idx].socket->close();
+            }
+        }
+    }
+}
+
+// ✅ Авто-разморозка: проверяем, не истёк ли срок заморозки у кого-нибудь
+void Server::checkExpiredFreezes()
+{
+    QList<int> userIds;
+    if (!UserManagers.getExpiredFreezes(userIds)) return;
+    for (int uid : userIds) {
+        if (UserManagers.unfreezeSubscription(uid)) {
+            qDebug() << "☀ Auto-unfrozen user" << uid;
+            // Если юзер онлайн — уведомим
+            if (QTcpSocket* s = findSocketByUserId(uid)) {
+                SendToClient(s, "SUBSCRIPTION_FROZEN_CHANGED|0");
             }
         }
     }
@@ -277,58 +347,43 @@ void Server::slotReadyRead()
     si.lastActivityTime = QDateTime::currentDateTime();
     si.packetCount++;
 
+    // ✅ Rate limiting — защита от flood-атак
+    qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    ipPacketTimestamps[si.clientIp].append(nowMs);
+    if (isRateLimited(si.clientIp)) {
+        qWarning() << "🚫 Rate limit exceeded for IP:" << si.clientIp << "— closing connection";
+        currentSocket->close();
+        return;
+    }
+
     // Читаем все доступные данные один раз
     QByteArray newData = currentSocket->readAll();
     si.bytesReceived += newData.size();
 
-    // Если мы в процессе получения изображения
-    if(isReceivingImage && expectedImageSize > 0) {
-        qDebug() << "Receiving image data... Current:" << imageBuffer.size() << "Expected:" << expectedImageSize;
+    // ✅ Используем per-socket image state (был race condition с глобальным состоянием)
+    if(si.isReceivingImage && si.expectedImageSize > 0) {
+        qDebug() << "Receiving image data... Current:" << si.imageBuffer.size() << "Expected:" << si.expectedImageSize;
 
         if(!newData.isEmpty()) {
-            imageBuffer.append(newData);
-            qDebug() << "Appended" << newData.size() << "bytes. Total:" << imageBuffer.size();
+            si.imageBuffer.append(newData);
         }
 
-        if(imageBuffer.size() >= (qint64)expectedImageSize) {
-            qDebug() << "Image complete! Processing...";
-
-            QByteArray completeImage = imageBuffer.left(expectedImageSize);
-            imageBuffer.clear();
-
-            if(currentMeasurementId > 0) {
-                // Фото замера — отвечаем PHOTO_SAVED
-                qDebug() << "=== saveMeasurementPhoto === User:" << currentImageUserId
-                         << "Measurement:" << currentMeasurementId << "Type:" << currentPhotoType;
-                if(UserManagers.saveMeasurementPhoto(currentImageUserId, currentMeasurementId, currentPhotoType, completeImage)) {
-                    SendToClient(currentSocket, QString("PHOTO_SAVED|%1|%2").arg(currentMeasurementId).arg(currentPhotoType));
-                    qDebug() << "Photo saved successfully for measurement" << currentMeasurementId;
-                } else {
-                    SendToClient(currentSocket, "PHOTO_SAVE_FAILED");
-                    qDebug() << "Error saving measurement photo";
-                }
-            } else {
-                // Аватар — отвечаем IMAGE_SAVED_SUCCESSFULLY
-                if(UserManagers.saveImage(currentImageUserId, completeImage)) {
-                    SendToClient(currentSocket, "IMAGE_SAVED_SUCCESSFULLY");
-                    qDebug() << "Avatar saved for user" << currentImageUserId;
-                } else {
-                    SendToClient(currentSocket, "DATABASE_SAVE_ERROR");
-                    qDebug() << "Error saving avatar to database";
-                }
-            }
-
-            isReceivingImage = false;
-            expectedImageSize = 0;
-            currentImageUserId = -1;
-            currentMeasurementId = -1;
-            currentPhotoType = "";
+        if((quint64)si.imageBuffer.size() >= si.expectedImageSize) {
+            finalizeIncomingImage(si, currentSocket);
         }
         return;
     }
 
     // Обработка команд — буферизация для больших пакетов
     si.buffer.append(newData);
+
+    // ✅ Защита от memory-DoS: жёсткий лимит на размер буфера
+    if (si.buffer.size() > (int)MAX_PACKET_SIZE) {
+        qWarning() << "🚫 Buffer overflow attempt from IP:" << si.clientIp
+                   << "(size=" << si.buffer.size() << ") — closing connection";
+        currentSocket->close();
+        return;
+    }
 
     while (si.buffer.size() > 0) {
         // Если ещё не знаем размер пакета, читаем первые 4 байта
@@ -348,6 +403,14 @@ void Server::slotReadyRead()
                 si.expectedSize = 0;
                 si.buffer.remove(0, sizeof(quint32));
                 continue;
+            }
+
+            // ✅ Защита от подделанного размера в заголовке — DoS через allocation
+            if (strByteLen > MAX_PACKET_SIZE) {
+                qWarning() << "🚫 Oversized packet header from IP:" << si.clientIp
+                           << "(claimed size=" << strByteLen << ") — closing connection";
+                currentSocket->close();
+                return;
             }
 
             // Полный размер пакета: 4 байта (длина строки) + strByteLen (данные UTF-16)
@@ -375,7 +438,110 @@ void Server::slotReadyRead()
         qDebug() << "=== Command received ===" << command.left(100);
 
         processCommand(currentSocket, command);
+
+        // ✅ Если команда взвела режим приёма фото — остаток si.buffer это
+        // начало бинаря (фото пришло одним TCP-пакетом с заголовком). Переносим
+        // его в si.imageBuffer и выходим из цикла, иначе следующая итерация
+        // попытается распарсить первые 4 байта PNG как длину строки →
+        // сработает анти-DoS защита и сокет будет закрыт.
+        if (si.isReceivingImage && !si.buffer.isEmpty()) {
+            si.imageBuffer.append(si.buffer);
+            si.buffer.clear();
+
+            // Если бинарь уже целиком в буфере — обрабатываем СРАЗУ.
+            // Раньше использовался QMetaObject::invokeMethod(slotReadyRead),
+            // но там sender() = nullptr → проверка currentSocket падала.
+            if ((quint64)si.imageBuffer.size() >= si.expectedImageSize) {
+                finalizeIncomingImage(si, currentSocket);
+            }
+            break;
+        }
     }
+}
+
+void Server::finalizeIncomingImage(SocketInfo& si, QTcpSocket* sock)
+{
+    qDebug() << "Image complete! Processing... type=" << si.imagePhotoType
+             << "fromAdmin=" << si.imageFromAdmin
+             << "size=" << si.expectedImageSize;
+
+    QByteArray completeImage = si.imageBuffer.left(si.expectedImageSize);
+    si.imageBuffer.clear();
+
+    if (si.imagePhotoType == "chat") {
+        // ✅ Фото в чате с тренером
+        qint64 chatMsgId = 0;
+        const bool fromAdmin = si.imageFromAdmin;
+        const int  userId    = si.imageUserId;
+        if (UserManagers.sendChatPhoto(userId, fromAdmin, completeImage, chatMsgId)) {
+            if (fromAdmin) {
+                SendToClient(sock,
+                             QString("ADMIN_CHAT_PHOTO_SENT|%1|%2").arg(userId).arg(chatMsgId));
+                if (QTcpSocket *userSock = findSocketByUserId(userId)) {
+                    SendToClient(userSock, "CHAT_NEW_MESSAGE");
+                }
+            } else {
+                SendToClient(sock,
+                             QString("CHAT_PHOTO_SAVED|%1").arg(chatMsgId));
+            }
+        } else {
+            SendToClient(sock, fromAdmin ? "ADMIN_CHAT_PHOTO_FAILED"
+                                          : "CHAT_PHOTO_SAVE_FAILED");
+        }
+    } else if (si.imagePhotoType == "support") {
+        // ✅ Фото в чате техподдержки — отдельный путь
+        qint64 chatMsgId = 0;
+        const bool fromAdmin = si.imageFromAdmin;
+        const int  userId    = si.imageUserId;
+        if (UserManagers.sendSupportPhoto(userId, fromAdmin, completeImage, chatMsgId)) {
+            if (fromAdmin) {
+                SendToClient(sock,
+                             QString("ADMIN_SUPPORT_PHOTO_SENT|%1|%2").arg(userId).arg(chatMsgId));
+                if (QTcpSocket *userSock = findSocketByUserId(userId)) {
+                    SendToClient(userSock, "SUPPORT_NEW_MESSAGE");
+                }
+            } else {
+                SendToClient(sock,
+                             QString("SUPPORT_PHOTO_SAVED|%1").arg(chatMsgId));
+            }
+        } else {
+            SendToClient(sock, fromAdmin ? "ADMIN_SUPPORT_PHOTO_FAILED"
+                                          : "SUPPORT_PHOTO_SAVE_FAILED");
+        }
+    } else if (si.imagePhotoType == "dish") {
+        int dishId = 0;
+        if (UserManagers.saveCookedDish(si.imageUserId, si.imageRecipeId, completeImage, dishId)) {
+            int reward = UserManagers.getBonusAmount("cooked_dish", 5);
+            SendToClient(sock, QString("DISH_SAVED|%1|%2").arg(dishId).arg(reward));
+        } else {
+            SendToClient(sock, "DISH_SAVE_FAILED");
+        }
+    } else if (si.imageMeasurementId > 0) {
+        qDebug() << "=== saveMeasurementPhoto === User:" << si.imageUserId
+                 << "Measurement:" << si.imageMeasurementId << "Type:" << si.imagePhotoType;
+        if (UserManagers.saveMeasurementPhoto(si.imageUserId, si.imageMeasurementId,
+                                              si.imagePhotoType, completeImage)) {
+            SendToClient(sock, QString("PHOTO_SAVED|%1|%2")
+                                   .arg(si.imageMeasurementId).arg(si.imagePhotoType));
+        } else {
+            SendToClient(sock, "PHOTO_SAVE_FAILED");
+        }
+    } else {
+        // Аватар
+        if (UserManagers.saveImage(si.imageUserId, completeImage)) {
+            SendToClient(sock, "IMAGE_SAVED_SUCCESSFULLY");
+        } else {
+            SendToClient(sock, "DATABASE_SAVE_ERROR");
+        }
+    }
+
+    si.isReceivingImage = false;
+    si.expectedImageSize = 0;
+    si.imageUserId = -1;
+    si.imageMeasurementId = -1;
+    si.imageRecipeId = -1;
+    si.imagePhotoType.clear();
+    si.imageFromAdmin = false;
 }
 
 void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
@@ -384,6 +550,23 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
     if(index == -1) return;
 
     SocketInfo& info = Sockets[index];
+
+    // ✅ Централизованный гейт авторизации:
+    // Команды AUTH/REG/ADMIN_LOGIN/LoadUserData не требуют предварительной аутентификации
+    // (LoadUserData — это часть восстановления сессии на Android, см. handlers ниже).
+    // Все остальные команды требуют info.authenticated == true.
+    const bool isPublic =
+        command.startsWith("AUTH|") ||
+        command.startsWith("REG|") ||
+        command.startsWith("ADMIN_LOGIN|") ||
+        command.startsWith("LoadUserData|");
+
+    if (!isPublic && !info.authenticated) {
+        qWarning() << "🚫 Unauthenticated command rejected:" << command.left(30)
+                   << "from IP:" << info.clientIp;
+        SendToClient(currentSocket, "UNAUTHORIZED");
+        return;
+    }
 
     //AUTH команда
     if(command.startsWith("AUTH|")) {
@@ -439,10 +622,18 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         if(parts.size() >= 2) {
             int user_id = parts.at(1).toInt();
 
-            // Сохраняем userId в сокете — нужно для push-уведомлений (запросы в друзья и т.п.)
-            // На Android сессия восстанавливается без AUTH, поэтому userId ставим здесь.
-            if (info.userId == -1)
+            // ✅ Особая логика: на Android сессия восстанавливается без AUTH,
+            // поэтому первая LoadUserData "связывает" сокет с userId.
+            // После связки команда становится IDOR-safe (требует совпадения).
+            if (info.userId == -1) {
                 info.userId = user_id;
+                info.authenticated = true;     // session restored
+            } else if (info.userId != user_id) {
+                qWarning() << "🚫 IDOR in LoadUserData: socket user=" << info.userId
+                           << "tried user=" << user_id << "from IP:" << info.clientIp;
+                SendToClient(currentSocket, "FORBIDDEN");
+                return;
+            }
 
             QString first_name;
             QString last_name;
@@ -453,16 +644,27 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
             QString goal = "...";
             int planTrainningUserData = 0;
             int standardSubscription = 0;
+            int vipSubscription = 0;
+            int subscriptionFrozen = 0;
+            int feedbackSubscription = 0;
 
             if(UserManagers.loadUserData(user_id, first_name, last_name, gender,
-                                          age, height, weight, goal, planTrainningUserData, standardSubscription)) {
+                                          age, height, weight, goal, planTrainningUserData,
+                                          standardSubscription, vipSubscription, subscriptionFrozen,
+                                          feedbackSubscription)) {
                 SendToClient(currentSocket,
-                             QString("LOADUSERDATA|%1|%2|%3|%4|%5|%6|%7|%8|%9")
+                             QString("LOADUSERDATA|%1|%2|%3|%4|%5|%6|%7|%8|%9|%10|%11|%12")
                                  .arg(first_name).arg(last_name).arg(gender).arg(age)
                                  .arg((int)height).arg((int)weight).arg(goal)
-                                 .arg(planTrainningUserData).arg(standardSubscription));
+                                 .arg(planTrainningUserData).arg(standardSubscription)
+                                 .arg(vipSubscription).arg(subscriptionFrozen)
+                                 .arg(feedbackSubscription));
 
-                qDebug() << "User data loaded for user ID:" << user_id << "subscription:" << standardSubscription;
+                qDebug() << "User data loaded for user ID:" << user_id
+                         << "subscription:" << standardSubscription
+                         << "vip:" << vipSubscription
+                         << "feedback:" << feedbackSubscription
+                         << "frozen:" << subscriptionFrozen;
             } else {
                 SendToClient(currentSocket, "LOADUSERDATA_FAILED");
                 qDebug() << "Failed to load user data for ID:" << user_id;
@@ -474,6 +676,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 9) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             QString first_name = parts.at(2);
             QString last_name = parts.at(3);
             QString gender = parts.at(4);
@@ -497,13 +700,13 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 3) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             bool ok;
             quint64 imgSize = parts.at(2).toULongLong(&ok);
-            quint64 maxImageSize = 1024 * 1024 * 100; // 100 MB
 
             qDebug() << "IMGAVATAR request: user_id=" << user_id << "size=" << imgSize;
 
-            if(ok && imgSize > 0 && imgSize <= maxImageSize) {
+            if(ok && imgSize > 0 && imgSize <= MAX_IMAGE_SIZE) {
                 // Читаем оставшиеся данные после заголовка команды
                 QByteArray remainingData = currentSocket->readAll();
 
@@ -521,17 +724,17 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
                         qDebug() << "Error saving image";
                     }
                 } else {
-                    // Данные придут несколькими пакетами
-                    imageBuffer.clear();
-                    imageBuffer.append(remainingData);
-                    expectedImageSize = imgSize;
-                    currentImageUserId = user_id;
-                    currentMeasurementId = -1;   // это аватар, не замер
-                    currentPhotoType = "";
-                    isReceivingImage = true;
+                    // ✅ Данные придут несколькими пакетами — состояние per-socket
+                    info.imageBuffer.clear();
+                    info.imageBuffer.append(remainingData);
+                    info.expectedImageSize = imgSize;
+                    info.imageUserId = user_id;
+                    info.imageMeasurementId = -1;
+                    info.imagePhotoType.clear();
+                    info.isReceivingImage = true;
 
-                    qDebug() << "Image receiving started. Have:" << imageBuffer.size()
-                             << "Need:" << expectedImageSize;
+                    qDebug() << "Image receiving started. Have:" << info.imageBuffer.size()
+                             << "Need:" << info.expectedImageSize;
                 }
             } else {
                 SendToClient(currentSocket, "BAD_COMMAND_FORMAT");
@@ -544,6 +747,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 2) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
 
             qDebug() << "LOADIMGAVATAR request for user_id:" << user_id;
 
@@ -567,6 +771,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 3) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             int planTrainningUser = parts.at(2).toInt();
 
             if(UserManagers.saveEPlanTrainningUserData(user_id, planTrainningUser)) {
@@ -583,15 +788,16 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 8) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             QString date = parts.at(2);
             QString weight = parts.at(3);
-            QString neck = parts.at(4);
+            QString chest = parts.at(4);
             QString waist = parts.at(5);
             QString hips = parts.at(6);
             QString steps = parts.at(7);
 
             int measurement_id = -1;
-            if(UserManagers.createMeasurement(user_id, date, weight, neck, waist, hips, steps, measurement_id)) {
+            if(UserManagers.createMeasurement(user_id, date, weight, chest, waist, hips, steps, measurement_id)) {
                 SendToClient(currentSocket, QString("CREATEMEASUREMENT_SUCCESS|%1").arg(measurement_id));
                 qDebug() << "Measurement created for user" << user_id << "ID:" << measurement_id;
             } else {
@@ -629,16 +835,23 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             int measurement_id = parts.at(2).toInt();
             QString photoType = parts.at(3);
             bool ok;
             quint64 imgSize = parts.at(4).toULongLong(&ok);
-            quint64 maxImageSize = 1024 * 1024 * 100;
 
             qDebug() << "UPLOAD_MEASUREMENT_PHOTO: user_id=" << user_id << "measurement_id=" << measurement_id
                      << "type=" << photoType << "size=" << imgSize;
 
-            if(ok && imgSize > 0 && imgSize <= maxImageSize) {
+            // ✅ Валидация photoType — только конкретные значения
+            if (photoType != "front" && photoType != "side" && photoType != "back") {
+                SendToClient(currentSocket, "BAD_COMMAND_FORMAT");
+                qDebug() << "Invalid photoType:" << photoType;
+                return;
+            }
+
+            if(ok && imgSize > 0 && imgSize <= MAX_IMAGE_SIZE) {
                 QByteArray remainingData = currentSocket->readAll();
                 qDebug() << "Remaining bytes:" << remainingData.size() << "Need:" << imgSize;
 
@@ -655,16 +868,17 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
                     }
                 } else {
                     qDebug() << "Photo will come in parts";
-                    imageBuffer.clear();
-                    imageBuffer.append(remainingData);
-                    expectedImageSize = imgSize;
-                    currentImageUserId = user_id;
-                    currentMeasurementId = measurement_id;
-                    currentPhotoType = photoType;
-                    isReceivingImage = true;
+                    // ✅ Per-socket state
+                    info.imageBuffer.clear();
+                    info.imageBuffer.append(remainingData);
+                    info.expectedImageSize = imgSize;
+                    info.imageUserId = user_id;
+                    info.imageMeasurementId = measurement_id;
+                    info.imagePhotoType = photoType;
+                    info.isReceivingImage = true;
 
-                    qDebug() << "Waiting for rest of image. Have:" << imageBuffer.size()
-                             << "Need:" << expectedImageSize;
+                    qDebug() << "Waiting for rest of image. Have:" << info.imageBuffer.size()
+                             << "Need:" << info.expectedImageSize;
                 }
             } else {
                 SendToClient(currentSocket, "BAD_COMMAND_FORMAT");
@@ -677,6 +891,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 2) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
 
             qDebug() << "LOADMEASUREMENTS request for user_id:" << user_id;
 
@@ -697,6 +912,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = parts.at(2).toFloat();
             float approach2 = parts.at(3).toFloat();
             float approach3 = parts.at(4).toFloat();
@@ -713,6 +929,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 2) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = 0, approach2 = 0, approach3 = 0;
 
             if(UserManagers.GetSaveTrainingVerticalThrustP1(user_id, approach1, approach2, approach3)) {
@@ -730,6 +947,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = parts.at(2).toFloat();
             float approach2 = parts.at(3).toFloat();
             float approach3 = parts.at(4).toFloat();
@@ -746,6 +964,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 2) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = 0, approach2 = 0, approach3 = 0;
 
             if(UserManagers.GetSaveTrainingButtockBridgeP1(user_id, approach1, approach2, approach3)) {
@@ -763,6 +982,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = parts.at(2).toFloat();
             float approach2 = parts.at(3).toFloat();
             float approach3 = parts.at(4).toFloat();
@@ -779,6 +999,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 2) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = 0, approach2 = 0, approach3 = 0;
 
             if(UserManagers.GetSaveTrainingChestPressP1(user_id, approach1, approach2, approach3)) {
@@ -796,6 +1017,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = parts.at(2).toFloat();
             float approach2 = parts.at(3).toFloat();
             float approach3 = parts.at(4).toFloat();
@@ -812,6 +1034,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 2) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = 0, approach2 = 0, approach3 = 0;
 
             if(UserManagers.GetSaveTrainingOneLegBenchPressP1(user_id, approach1, approach2, approach3)) {
@@ -829,6 +1052,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = parts.at(2).toFloat();
             float approach2 = parts.at(3).toFloat();
             float approach3 = parts.at(4).toFloat();
@@ -845,6 +1069,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 2) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = 0, approach2 = 0, approach3 = 0;
 
             if(UserManagers.GetSaveTrainingHorizontalThrustP1(user_id, approach1, approach2, approach3)) {
@@ -862,6 +1087,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = parts.at(2).toFloat();
             float approach2 = parts.at(3).toFloat();
             float approach3 = parts.at(4).toFloat();
@@ -878,6 +1104,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 2) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = 0, approach2 = 0, approach3 = 0;
 
             if(UserManagers.GetSaveTrainingPressOnMatP1(user_id, approach1, approach2, approach3)) {
@@ -895,6 +1122,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = parts.at(2).toFloat();
             float approach2 = parts.at(3).toFloat();
             float approach3 = parts.at(4).toFloat();
@@ -911,6 +1139,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 2) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = 0, approach2 = 0, approach3 = 0;
 
             if(UserManagers.GetSaveTrainingPressOnBallP1(user_id, approach1, approach2, approach3)) {
@@ -928,6 +1157,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = parts.at(2).toFloat();
             float approach2 = parts.at(3).toFloat();
             float approach3 = parts.at(4).toFloat();
@@ -944,6 +1174,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 2) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = 0, approach2 = 0, approach3 = 0;
 
             if(UserManagers.GetSaveTrainingKettlebellSquatP1(user_id, approach1, approach2, approach3)) {
@@ -961,6 +1192,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = parts.at(2).toFloat();
             float approach2 = parts.at(3).toFloat();
             float approach3 = parts.at(4).toFloat();
@@ -977,6 +1209,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 2) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = 0, approach2 = 0, approach3 = 0;
 
             if(UserManagers.GetSaveTrainingRomanianDeadliftP1(user_id, approach1, approach2, approach3)) {
@@ -994,6 +1227,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = parts.at(2).toFloat();
             float approach2 = parts.at(3).toFloat();
             float approach3 = parts.at(4).toFloat();
@@ -1010,6 +1244,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 2) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = 0, approach2 = 0, approach3 = 0;
 
             if(UserManagers.GetSaveTrainingKneePushupP1(user_id, approach1, approach2, approach3)) {
@@ -1027,6 +1262,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = parts.at(2).toFloat();
             float approach2 = parts.at(3).toFloat();
             float approach3 = parts.at(4).toFloat();
@@ -1043,6 +1279,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 2) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = 0, approach2 = 0, approach3 = 0;
 
             if(UserManagers.GetSaveTrainingHipAbductionP1(user_id, approach1, approach2, approach3)) {
@@ -1060,6 +1297,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = parts.at(2).toFloat();
             float approach2 = parts.at(3).toFloat();
             float approach3 = parts.at(4).toFloat();
@@ -1076,6 +1314,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 2) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = 0, approach2 = 0, approach3 = 0;
 
             if(UserManagers.GetSaveTrainingTricepExtensionP1(user_id, approach1, approach2, approach3)) {
@@ -1093,6 +1332,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = parts.at(2).toFloat();
             float approach2 = parts.at(3).toFloat();
             float approach3 = parts.at(4).toFloat();
@@ -1109,6 +1349,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 2) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = 0, approach2 = 0, approach3 = 0;
 
             if(UserManagers.GetSaveTrainingAssistedPullupP1(user_id, approach1, approach2, approach3)) {
@@ -1126,6 +1367,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = parts.at(2).toFloat();
             float approach2 = parts.at(3).toFloat();
             float approach3 = parts.at(4).toFloat();
@@ -1142,6 +1384,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 2) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = 0, approach2 = 0, approach3 = 0;
 
             if(UserManagers.GetSaveTrainingBulgarianSplitSquatP1(user_id, approach1, approach2, approach3)) {
@@ -1159,6 +1402,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = parts.at(2).toFloat();
             float approach2 = parts.at(3).toFloat();
             float approach3 = parts.at(4).toFloat();
@@ -1175,6 +1419,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 2) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = 0, approach2 = 0, approach3 = 0;
 
             if(UserManagers.GetSaveTrainingShoulderPressP1(user_id, approach1, approach2, approach3)) {
@@ -1192,6 +1437,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = parts.at(2).toFloat();
             float approach2 = parts.at(3).toFloat();
             float approach3 = parts.at(4).toFloat();
@@ -1208,6 +1454,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 2) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = 0, approach2 = 0, approach3 = 0;
             UserManagers.GetSaveTrainingCableFlyP1(user_id, approach1, approach2, approach3);
             // Нет записи = нули, всегда SUCCESS
@@ -1222,6 +1469,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = parts.at(2).toFloat();
             float approach2 = parts.at(3).toFloat();
             float approach3 = parts.at(4).toFloat();
@@ -1238,6 +1486,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 2) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = 0, approach2 = 0, approach3 = 0;
 
             if(UserManagers.GetSaveTrainingLegExtensionP1(user_id, approach1, approach2, approach3)) {
@@ -1255,6 +1504,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = parts.at(2).toFloat();
             float approach2 = parts.at(3).toFloat();
             float approach3 = parts.at(4).toFloat();
@@ -1271,6 +1521,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 2) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = 0, approach2 = 0, approach3 = 0;
 
             if(UserManagers.GetSaveTrainingPlankP1(user_id, approach1, approach2, approach3)) {
@@ -1288,6 +1539,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = parts.at(2).toFloat();
             float approach2 = parts.at(3).toFloat();
             float approach3 = parts.at(4).toFloat();
@@ -1304,6 +1556,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 2) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float approach1 = 0, approach2 = 0, approach3 = 0;
 
             if(UserManagers.GetSaveTrainingChestFlyP1(user_id, approach1, approach2, approach3)) {
@@ -1321,6 +1574,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
             if(UserManagers.saveTrainingHipAbductionLeanP2(user_id,a1,a2,a3))
                 SendToClient(currentSocket,"SAVE_TRAINING_HIP_ABDUCTION_LEAN_P2_SUCCESS");
@@ -1341,6 +1595,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
             if(UserManagers.saveTrainingPushupP2(user_id,a1,a2,a3))
                 SendToClient(currentSocket,"SAVE_TRAINING_PUSHUP_P2_SUCCESS");
@@ -1361,6 +1616,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
             if(UserManagers.saveTrainingHipAbduction90P2(user_id,a1,a2,a3))
                 SendToClient(currentSocket,"SAVE_TRAINING_HIP_ABDUCTION_90_P2_SUCCESS");
@@ -1381,6 +1637,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
             if(UserManagers.saveTrainingPullupP2(user_id,a1,a2,a3))
                 SendToClient(currentSocket,"SAVE_TRAINING_PULLUP_P2_SUCCESS");
@@ -1401,6 +1658,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
             if(UserManagers.saveTrainingLegExtensionFrogP2(user_id,a1,a2,a3))
                 SendToClient(currentSocket,"SAVE_TRAINING_LEG_EXTENSION_FROG_P2_SUCCESS");
@@ -1426,6 +1684,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
             if(UserManagers.saveTrainingCraneP3(user_id,a1,a2,a3))
                 SendToClient(currentSocket,"SAVE_TRAINING_CRANE_P3_SUCCESS");
@@ -1446,6 +1705,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
             if(UserManagers.saveTrainingShoulderSideRaiseSitP3(user_id,a1,a2,a3))
                 SendToClient(currentSocket,"SAVE_TRAINING_SHOULDER_SIDE_RAISE_SIT_P3_SUCCESS");
@@ -1466,6 +1726,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
             if(UserManagers.saveTrainingGoodmorningHackP3(user_id,a1,a2,a3))
                 SendToClient(currentSocket,"SAVE_TRAINING_GOODMORNING_HACK_P3_SUCCESS");
@@ -1486,6 +1747,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
             if(UserManagers.saveTrainingShoulderRaiseOneHandBenchP3(user_id,a1,a2,a3))
                 SendToClient(currentSocket,"SAVE_TRAINING_SHOULDER_RAISE_ONE_HAND_BENCH_P3_SUCCESS");
@@ -1506,6 +1768,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
             if(UserManagers.saveTrainingFroggyStandP3(user_id,a1,a2,a3))
                 SendToClient(currentSocket,"SAVE_TRAINING_FROGGY_STAND_P3_SUCCESS");
@@ -1526,6 +1789,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
             if(UserManagers.saveTrainingHackSquatP3(user_id,a1,a2,a3))
                 SendToClient(currentSocket,"SAVE_TRAINING_HACK_SQUAT_P3_SUCCESS");
@@ -1546,6 +1810,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
             if(UserManagers.saveTrainingPulloverP3(user_id,a1,a2,a3))
                 SendToClient(currentSocket,"SAVE_TRAINING_PULLOVER_P3_SUCCESS");
@@ -1566,6 +1831,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
             if(UserManagers.saveTrainingCrossoverDiagonalKickP3(user_id,a1,a2,a3))
                 SendToClient(currentSocket,"SAVE_TRAINING_CROSSOVER_DIAGONAL_KICK_P3_SUCCESS");
@@ -1586,6 +1852,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
             if(UserManagers.saveTrainingWallAbductionOneP3(user_id,a1,a2,a3))
                 SendToClient(currentSocket,"SAVE_TRAINING_WALL_ABDUCTION_ONE_P3_SUCCESS");
@@ -1611,6 +1878,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
             if(UserManagers.saveTrainingCableKickbackP4(user_id,a1,a2,a3))
                 SendToClient(currentSocket,"SAVE_TRAINING_CABLE_KICKBACK_P4_SUCCESS");
@@ -1631,6 +1899,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
             if(UserManagers.saveTrainingCrossoverStepUpP4(user_id,a1,a2,a3))
                 SendToClient(currentSocket,"SAVE_TRAINING_CROSSOVER_STEP_UP_P4_SUCCESS");
@@ -1651,6 +1920,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
             if(UserManagers.saveTrainingDipsP4(user_id,a1,a2,a3))
                 SendToClient(currentSocket,"SAVE_TRAINING_DIPS_P4_SUCCESS");
@@ -1671,6 +1941,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
             if(UserManagers.saveTrainingCableStorkP4(user_id,a1,a2,a3))
                 SendToClient(currentSocket,"SAVE_TRAINING_CABLE_STORK_P4_SUCCESS");
@@ -1691,6 +1962,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
             if(UserManagers.saveTrainingGluteBridgeSingleLegP4(user_id,a1,a2,a3))
                 SendToClient(currentSocket,"SAVE_TRAINING_GLUTE_BRIDGE_SINGLE_LEG_P4_SUCCESS");
@@ -1711,6 +1983,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
             if(UserManagers.saveTrainingCableRotationP4(user_id,a1,a2,a3))
                 SendToClient(currentSocket,"SAVE_TRAINING_CABLE_ROTATION_P4_SUCCESS");
@@ -1736,6 +2009,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
             if(UserManagers.saveTrainingNegativePullupP7(user_id,a1,a2,a3))
                 SendToClient(currentSocket,"SAVE_TRAINING_NEGATIVE_PULLUP_P7_SUCCESS");
@@ -1756,6 +2030,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
             if(UserManagers.saveTrainingBarbellBicepCurlP7(user_id,a1,a2,a3))
                 SendToClient(currentSocket,"SAVE_TRAINING_BARBELL_BICEP_CURL_P7_SUCCESS");
@@ -1776,6 +2051,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
             if(UserManagers.saveTrainingLegRaiseElbowP7(user_id,a1,a2,a3))
                 SendToClient(currentSocket,"SAVE_TRAINING_LEG_RAISE_ELBOW_P7_SUCCESS");
@@ -1796,6 +2072,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if(parts.size() >= 5) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             float a1=parts.at(2).toFloat(), a2=parts.at(3).toFloat(), a3=parts.at(4).toFloat();
             if(UserManagers.saveTrainingBrachialiscurlP7(user_id,a1,a2,a3))
                 SendToClient(currentSocket,"SAVE_TRAINING_BRACHIALIS_CURL_P7_SUCCESS");
@@ -1843,6 +2120,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
             SendToClient(currentSocket, "RESET_WORKOUT_PROGRESS_FAILED|bad_format");
         } else {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             if (UserManagers.resetWorkoutProgress(user_id)) {
                 SendToClient(currentSocket, "RESET_WORKOUT_PROGRESS_SUCCESS");
                 qDebug() << "✅ RESET_WORKOUT_PROGRESS: user" << user_id;
@@ -1989,6 +2267,33 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         }
     }
 
+    // ADD_DISH_TO_DIET|user_id|date|recipe_name_base64
+    // Начисляет призовые баллы за добавление уникального блюда в рацион (один раз за день на блюдо).
+    else if (command.startsWith("ADD_DISH_TO_DIET|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 4) {
+            int user_id = parts.at(1).toInt();
+            QString date = parts.at(2);
+            // имя может содержать «|», поэтому передаём base64
+            QString nameB64 = parts.mid(3).join("|");
+            QString recipeName = QString::fromUtf8(QByteArray::fromBase64(nameB64.toLatin1()));
+
+            int awarded = 0;
+            if (UserManagers.addDishToDiet(user_id, recipeName, date, awarded)) {
+                int total = 0;
+                UserManagers.getUserKachballs(user_id, total);
+                SendToClient(currentSocket,
+                             QString("DISH_DIET_REWARD|%1|%2").arg(awarded).arg(total));
+                qDebug() << "✅ ADD_DISH_TO_DIET user" << user_id
+                         << "dish:" << recipeName << "+" << awarded;
+            } else {
+                SendToClient(currentSocket, "DISH_DIET_REWARD_FAILED");
+            }
+        } else {
+            SendToClient(currentSocket, "BAD_COMMAND_FORMAT");
+        }
+    }
+
     // GET_DAILY_NUTRITION|user_id|date
     else if (command.startsWith("GET_DAILY_NUTRITION|")) {
         QStringList parts = command.split("|");
@@ -2020,6 +2325,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if (parts.size() >= 2) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             QString jsonData;
 
             if (UserManagers.loadNutritionHistory(user_id, jsonData)) {
@@ -2034,6 +2340,433 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         }
     }
 
+    // ═════════════════════════════════════════════════════════════════════
+    // ✅ ЧАТ ПОДДЕРЖКИ (доступен пользователям с Feedback или VIP подпиской)
+    // ═════════════════════════════════════════════════════════════════════
+    // CHAT_SEND|user_id|<base64-text>
+    else if (command.startsWith("CHAT_SEND|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 3) {
+            int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, "CHAT_SEND")) return;
+            QString text = QString::fromUtf8(QByteArray::fromBase64(parts.at(2).toLatin1()));
+            qint64 msgId = 0;
+            if (UserManagers.sendChatMessage(user_id, /*fromAdmin=*/false, text, msgId))
+                SendToClient(currentSocket, QString("CHAT_SENT|%1").arg(msgId));
+            else
+                SendToClient(currentSocket, "CHAT_SEND_FAILED");
+        }
+    }
+    // CHAT_SEND_PHOTO|user_id|size + bytes — пользователь шлёт фото в чат
+    else if (command.startsWith("CHAT_SEND_PHOTO|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 3) {
+            int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, "CHAT_SEND_PHOTO")) return;
+            bool ok = false;
+            quint64 imgSize = parts.at(2).toULongLong(&ok);
+
+            if (!ok || imgSize == 0 || imgSize > MAX_IMAGE_SIZE) {
+                SendToClient(currentSocket, "BAD_COMMAND_FORMAT");
+                return;
+            }
+
+            QByteArray remainingData = currentSocket->readAll();
+            if (remainingData.size() >= (qint64)imgSize) {
+                QByteArray imageData = remainingData.left(imgSize);
+                qint64 msgId = 0;
+                if (UserManagers.sendChatPhoto(user_id, /*fromAdmin=*/false, imageData, msgId)) {
+                    SendToClient(currentSocket, QString("CHAT_PHOTO_SAVED|%1").arg(msgId));
+                } else {
+                    SendToClient(currentSocket, "CHAT_PHOTO_SAVE_FAILED");
+                }
+            } else {
+                // Пакет придёт частями — настраиваем per-socket state
+                info.imageBuffer.clear();
+                info.imageBuffer.append(remainingData);
+                info.expectedImageSize = imgSize;
+                info.imageUserId = user_id;
+                info.imageMeasurementId = -1;
+                info.imageRecipeId = -1;
+                info.imagePhotoType = "chat";
+                info.imageFromAdmin = false;
+                info.isReceivingImage = true;
+            }
+        } else {
+            SendToClient(currentSocket, "BAD_COMMAND_FORMAT");
+        }
+    }
+    // GET_CHAT_PHOTO|message_id — загрузить бинарь конкретного фото-сообщения
+    else if (command.startsWith("GET_CHAT_PHOTO|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 2) {
+            qint64 msgId = parts.at(1).toLongLong();
+            QByteArray photoData;
+            if (UserManagers.getChatPhoto(msgId, photoData)) {
+                // Заголовок: GET_CHAT_PHOTO|msgId|size, далее бинарные байты
+                SendToClient(currentSocket,
+                             QString("GET_CHAT_PHOTO|%1|%2").arg(msgId).arg(photoData.size()));
+                currentSocket->write(photoData);
+            } else {
+                SendToClient(currentSocket, QString("CHAT_PHOTO_NOT_FOUND|%1").arg(msgId));
+            }
+        }
+    }
+    // ═════════════════════════════════════════════════════════════════════
+    // ✅ ЧАТ ТЕХНИЧЕСКОЙ ПОДДЕРЖКИ (доступен ВСЕМ юзерам, не зависит от тарифа)
+    // ═════════════════════════════════════════════════════════════════════
+    // SUPPORT_SEND|user_id|<base64-text>
+    else if (command.startsWith("SUPPORT_SEND|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 3) {
+            int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, "SUPPORT_SEND")) return;
+            QString text = QString::fromUtf8(QByteArray::fromBase64(parts.at(2).toLatin1()));
+            qint64 msgId = 0;
+            if (UserManagers.sendSupportMessage(user_id, /*fromAdmin=*/false, text, msgId))
+                SendToClient(currentSocket, QString("SUPPORT_SENT|%1").arg(msgId));
+            else
+                SendToClient(currentSocket, "SUPPORT_SEND_FAILED");
+        }
+    }
+    // SUPPORT_LOAD|user_id
+    else if (command.startsWith("SUPPORT_LOAD|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 2) {
+            int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, "SUPPORT_LOAD")) return;
+            QString json;
+            if (UserManagers.loadSupportHistory(user_id, json)) {
+                UserManagers.markSupportRead(user_id, /*byAdmin=*/false);
+                SendToClient(currentSocket, "SUPPORT_HISTORY|" + json);
+            } else {
+                SendToClient(currentSocket, "SUPPORT_LOAD_FAILED");
+            }
+        }
+    }
+    // SUPPORT_UNREAD|user_id
+    else if (command.startsWith("SUPPORT_UNREAD|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 2) {
+            int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, "SUPPORT_UNREAD")) return;
+            int n = 0;
+            UserManagers.countSupportUnreadForUser(user_id, n);
+            SendToClient(currentSocket, QString("SUPPORT_UNREAD_COUNT|%1").arg(n));
+        }
+    }
+    // SUPPORT_CLEAR|user_id
+    else if (command.startsWith("SUPPORT_CLEAR|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 2) {
+            int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, "SUPPORT_CLEAR")) return;
+            int deleted = 0;
+            if (UserManagers.clearSupportHistory(user_id, deleted))
+                SendToClient(currentSocket, QString("SUPPORT_CLEARED|%1").arg(deleted));
+            else
+                SendToClient(currentSocket, "SUPPORT_CLEAR_FAILED");
+        }
+    }
+    // SUPPORT_SEND_PHOTO|user_id|size + bytes
+    else if (command.startsWith("SUPPORT_SEND_PHOTO|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 3) {
+            int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, "SUPPORT_SEND_PHOTO")) return;
+            bool ok = false;
+            quint64 imgSize = parts.at(2).toULongLong(&ok);
+            if (!ok || imgSize == 0 || imgSize > MAX_IMAGE_SIZE) {
+                SendToClient(currentSocket, "BAD_COMMAND_FORMAT");
+                return;
+            }
+            QByteArray remainingData = currentSocket->readAll();
+            if (remainingData.size() >= (qint64)imgSize) {
+                QByteArray imgData = remainingData.left(imgSize);
+                qint64 msgId = 0;
+                if (UserManagers.sendSupportPhoto(user_id, /*fromAdmin=*/false, imgData, msgId))
+                    SendToClient(currentSocket, QString("SUPPORT_PHOTO_SAVED|%1").arg(msgId));
+                else
+                    SendToClient(currentSocket, "SUPPORT_PHOTO_SAVE_FAILED");
+            } else {
+                info.imageBuffer.clear();
+                info.imageBuffer.append(remainingData);
+                info.expectedImageSize = imgSize;
+                info.imageUserId = user_id;
+                info.imageMeasurementId = -1;
+                info.imageRecipeId = -1;
+                info.imagePhotoType = "support";
+                info.imageFromAdmin = false;
+                info.isReceivingImage = true;
+            }
+        }
+    }
+    // GET_SUPPORT_PHOTO|message_id
+    else if (command.startsWith("GET_SUPPORT_PHOTO|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 2) {
+            qint64 msgId = parts.at(1).toLongLong();
+            QByteArray photoData;
+            if (UserManagers.getSupportPhoto(msgId, photoData)) {
+                SendToClient(currentSocket,
+                             QString("GET_SUPPORT_PHOTO|%1|%2").arg(msgId).arg(photoData.size()));
+                currentSocket->write(photoData);
+            } else {
+                SendToClient(currentSocket, QString("SUPPORT_PHOTO_NOT_FOUND|%1").arg(msgId));
+            }
+        }
+    }
+    // ─── Админ: техподдержка ──────────────────────────────────
+    else if (command == "ADMIN_GET_SUPPORT_CONVERSATIONS") {
+        QString json;
+        if (UserManagers.getAdminSupportConversations(json))
+            SendToClient(currentSocket, "ADMIN_SUPPORT_CONVERSATIONS_DATA|" + json);
+        else
+            SendToClient(currentSocket, "ADMIN_SUPPORT_CONVERSATIONS_FAILED");
+    }
+    else if (command.startsWith("ADMIN_GET_SUPPORT_CHAT|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 2) {
+            int user_id = parts.at(1).toInt();
+            QString json;
+            if (UserManagers.loadSupportHistory(user_id, json)) {
+                UserManagers.markSupportRead(user_id, /*byAdmin=*/true);
+                SendToClient(currentSocket, QString("ADMIN_SUPPORT_CHAT_DATA|%1|%2").arg(user_id).arg(json));
+            } else {
+                SendToClient(currentSocket, "ADMIN_SUPPORT_CHAT_FAILED");
+            }
+        }
+    }
+    else if (command.startsWith("ADMIN_SEND_SUPPORT_MESSAGE|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 3) {
+            int user_id = parts.at(1).toInt();
+            QString text = QString::fromUtf8(QByteArray::fromBase64(parts.at(2).toLatin1()));
+            qint64 msgId = 0;
+            if (UserManagers.sendSupportMessage(user_id, /*fromAdmin=*/true, text, msgId)) {
+                SendToClient(currentSocket,
+                             QString("ADMIN_SUPPORT_MESSAGE_SENT|%1|%2").arg(user_id).arg(msgId));
+                if (QTcpSocket* userSock = findSocketByUserId(user_id))
+                    SendToClient(userSock, "SUPPORT_NEW_MESSAGE");
+            } else {
+                SendToClient(currentSocket, "ADMIN_SUPPORT_MESSAGE_FAILED");
+            }
+        }
+    }
+    else if (command.startsWith("ADMIN_SEND_SUPPORT_PHOTO|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 3) {
+            int user_id = parts.at(1).toInt();
+            bool ok = false;
+            quint64 imgSize = parts.at(2).toULongLong(&ok);
+            if (!ok || imgSize == 0 || imgSize > MAX_IMAGE_SIZE) {
+                SendToClient(currentSocket, "BAD_COMMAND_FORMAT");
+                return;
+            }
+            QByteArray remainingData = currentSocket->readAll();
+            if (remainingData.size() >= (qint64)imgSize) {
+                QByteArray imgData = remainingData.left(imgSize);
+                qint64 msgId = 0;
+                if (UserManagers.sendSupportPhoto(user_id, /*fromAdmin=*/true, imgData, msgId)) {
+                    SendToClient(currentSocket,
+                                 QString("ADMIN_SUPPORT_PHOTO_SENT|%1|%2").arg(user_id).arg(msgId));
+                    if (QTcpSocket* userSock = findSocketByUserId(user_id))
+                        SendToClient(userSock, "SUPPORT_NEW_MESSAGE");
+                } else {
+                    SendToClient(currentSocket, "ADMIN_SUPPORT_PHOTO_FAILED");
+                }
+            } else {
+                info.imageBuffer.clear();
+                info.imageBuffer.append(remainingData);
+                info.expectedImageSize = imgSize;
+                info.imageUserId = user_id;
+                info.imageMeasurementId = -1;
+                info.imageRecipeId = -1;
+                info.imagePhotoType = "support";
+                info.imageFromAdmin = true;
+                info.isReceivingImage = true;
+            }
+        }
+    }
+    else if (command.startsWith("ADMIN_CLEAR_SUPPORT|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 2) {
+            int user_id = parts.at(1).toInt();
+            int deleted = 0;
+            if (UserManagers.clearSupportHistory(user_id, deleted))
+                SendToClient(currentSocket,
+                             QString("ADMIN_SUPPORT_CLEARED|%1|%2").arg(user_id).arg(deleted));
+            else
+                SendToClient(currentSocket, "ADMIN_SUPPORT_CLEAR_FAILED");
+        }
+    }
+    // CHAT_CLEAR|user_id — пользователь стирает свою переписку с тренером
+    else if (command.startsWith("CHAT_CLEAR|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 2) {
+            int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, "CHAT_CLEAR")) return;
+            int deleted = 0;
+            if (UserManagers.clearChatHistory(user_id, deleted)) {
+                SendToClient(currentSocket, QString("CHAT_CLEARED|%1").arg(deleted));
+                // Уведомим админку (если кто-то её смотрит) — переписки больше нет
+                // через простое отображение «нет диалогов» при следующем GET_CONVERSATIONS.
+            } else {
+                SendToClient(currentSocket, "CHAT_CLEAR_FAILED");
+            }
+        }
+    }
+    // CHAT_LOAD|user_id — загрузить историю
+    else if (command.startsWith("CHAT_LOAD|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 2) {
+            int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, "CHAT_LOAD")) return;
+            QString json;
+            if (UserManagers.loadChatHistory(user_id, json)) {
+                UserManagers.markChatRead(user_id, /*byAdmin=*/false);
+                SendToClient(currentSocket, "CHAT_HISTORY|" + json);
+            } else {
+                SendToClient(currentSocket, "CHAT_LOAD_FAILED");
+            }
+        }
+    }
+    // CHAT_UNREAD|user_id
+    else if (command.startsWith("CHAT_UNREAD|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 2) {
+            int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, "CHAT_UNREAD")) return;
+            int n = 0;
+            UserManagers.countUnreadForUser(user_id, n);
+            SendToClient(currentSocket, QString("CHAT_UNREAD_COUNT|%1").arg(n));
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // ✅ УРОКИ — отметка просмотра + начисление баллов
+    // ═════════════════════════════════════════════════════════════════════
+    else if (command.startsWith("MARK_LESSON_VIEWED|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 3) {
+            int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, "MARK_LESSON_VIEWED")) return;
+            QString key = parts.at(2);
+            int awarded = 0;
+            if (UserManagers.markLessonViewed(user_id, key, awarded))
+                SendToClient(currentSocket, QString("LESSON_VIEWED_OK|%1|%2").arg(key).arg(awarded));
+            else
+                SendToClient(currentSocket, "LESSON_VIEWED_FAILED");
+        }
+    }
+    else if (command.startsWith("GET_VIEWED_LESSONS|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 2) {
+            int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, "GET_VIEWED_LESSONS")) return;
+            QString json;
+            if (UserManagers.loadViewedLessons(user_id, json))
+                SendToClient(currentSocket, "VIEWED_LESSONS|" + json);
+            else
+                SendToClient(currentSocket, "VIEWED_LESSONS_FAILED");
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // ✅ ИЗБРАННЫЕ РЕЦЕПТЫ
+    // ═════════════════════════════════════════════════════════════════════
+    else if (command.startsWith("ADD_FAVORITE_RECIPE|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 3) {
+            int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, "ADD_FAVORITE_RECIPE")) return;
+            int recipe_id = parts.at(2).toInt();
+            if (UserManagers.addFavoriteRecipe(user_id, recipe_id))
+                SendToClient(currentSocket, QString("FAVORITE_ADDED|%1").arg(recipe_id));
+            else
+                SendToClient(currentSocket, "FAVORITE_ADD_FAILED");
+        }
+    }
+    else if (command.startsWith("REMOVE_FAVORITE_RECIPE|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 3) {
+            int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, "REMOVE_FAVORITE_RECIPE")) return;
+            int recipe_id = parts.at(2).toInt();
+            if (UserManagers.removeFavoriteRecipe(user_id, recipe_id))
+                SendToClient(currentSocket, QString("FAVORITE_REMOVED|%1").arg(recipe_id));
+            else
+                SendToClient(currentSocket, "FAVORITE_REMOVE_FAILED");
+        }
+    }
+    else if (command.startsWith("GET_FAVORITE_RECIPES|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 2) {
+            int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, "GET_FAVORITE_RECIPES")) return;
+            QString json;
+            if (UserManagers.loadFavoriteRecipes(user_id, json))
+                SendToClient(currentSocket, "FAVORITE_RECIPES|" + json);
+            else
+                SendToClient(currentSocket, "FAVORITE_RECIPES_FAILED");
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // ✅ PUSH-устройства
+    // ═════════════════════════════════════════════════════════════════════
+    else if (command.startsWith("REGISTER_DEVICE|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 4) {
+            int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, "REGISTER_DEVICE")) return;
+            QString token = parts.at(2);
+            QString platform = parts.at(3);
+            if (UserManagers.registerDevice(user_id, token, platform))
+                SendToClient(currentSocket, "DEVICE_REGISTERED");
+            else
+                SendToClient(currentSocket, "DEVICE_REGISTER_FAILED");
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // ✅ COOKED_DISH — фото приготовленного блюда → +5 баллов
+    // Формат: COOKED_DISH|user_id|recipe_id|imgSize  + бинарные байты в потоке
+    // ═════════════════════════════════════════════════════════════════════
+    else if (command.startsWith("COOKED_DISH|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 4) {
+            int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, "COOKED_DISH")) return;
+            int recipe_id = parts.at(2).toInt();
+            bool ok = false;
+            quint64 imgSize = parts.at(3).toULongLong(&ok);
+            if (!ok || imgSize == 0 || imgSize > MAX_IMAGE_SIZE) {
+                SendToClient(currentSocket, "BAD_COMMAND_FORMAT");
+                return;
+            }
+            QByteArray remainingData = currentSocket->readAll();
+            if ((quint64)remainingData.size() >= imgSize) {
+                QByteArray photo = remainingData.left(imgSize);
+                int dishId = 0;
+                if (UserManagers.saveCookedDish(user_id, recipe_id, photo, dishId))
+                    SendToClient(currentSocket, QString("DISH_SAVED|%1|5").arg(dishId));   // +5 баллов
+                else
+                    SendToClient(currentSocket, "DISH_SAVE_FAILED");
+            } else {
+                // данные придут частями
+                info.imageBuffer.clear();
+                info.imageBuffer.append(remainingData);
+                info.expectedImageSize = imgSize;
+                info.imageUserId = user_id;
+                info.imageRecipeId = recipe_id;
+                info.imageMeasurementId = -1;
+                info.imagePhotoType = "dish";
+                info.isReceivingImage = true;
+            }
+        }
+    }
+
     // ✅ SAVE_PROGRAM|user_id|planInt
     // Сохраняет выбранный план тренировок в колонку PlanTrainning таблицы USERS
     // planInt: 0 = не выбрано, 1 = gym_1 (добавляйте новые значения при расширении)
@@ -2041,6 +2774,7 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         QStringList parts = command.split("|");
         if (parts.size() >= 3) {
             int user_id = parts.at(1).toInt();
+            if (!requireOwnership(currentSocket, info, user_id, command.left(40))) return;
             int planInt = parts.at(2).toInt();
 
             if (UserManagers.saveEPlanTrainningUserData(user_id, planInt)) {
@@ -2109,6 +2843,64 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
 
     // ==================== АДМИН-ПАНЕЛЬ ====================
 
+    // ✅ ADMIN_LOGIN|password — аутентификация админа
+    // Сравниваем SHA-256 хеш введённого пароля с тем, что сохранён в server_config.ini
+    // (рядом с exe). При первом запуске создаётся файл с дефолтным паролем Kech_Admin_2024.
+    else if (command.startsWith("ADMIN_LOGIN|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 2) {
+            // ✅ Rate limit на админ-логин — защита от bruteforce.
+            // Подсчитываем неудачные попытки на IP за последнюю минуту.
+            qint64 nowMs2 = QDateTime::currentMSecsSinceEpoch();
+            QVector<qint64>& fails = adminLoginFailures[info.clientIp];
+            while (!fails.isEmpty() && fails.first() < nowMs2 - 60000)
+                fails.removeFirst();
+            if (fails.size() >= 5) {
+                qWarning() << "🚫 Admin login bruteforce blocked from:" << info.clientIp;
+                SendToClient(currentSocket, "ADMIN_LOGIN_FAILED");
+                return;
+            }
+
+            // Загружаем конфиг (или создаём с дефолтным паролем)
+            const QString cfgPath = QCoreApplication::applicationDirPath() + "/server_config.ini";
+            QSettings cfg(cfgPath, QSettings::IniFormat);
+            QString storedHash = cfg.value("admin/password_sha256").toString();
+            if (storedHash.isEmpty()) {
+                // Первый запуск: ставим дефолтный пароль
+                const QByteArray defHash = QCryptographicHash::hash(
+                    QByteArray("Kech_Admin_2024"), QCryptographicHash::Sha256).toHex();
+                storedHash = QString::fromLatin1(defHash);
+                cfg.setValue("admin/password_sha256", storedHash);
+                cfg.sync();
+                qWarning() << "⚠️ Создан server_config.ini с дефолтным админ-паролем."
+                           << " СМЕНИТЕ его в файле:" << cfgPath;
+            }
+
+            const QByteArray inputHash = QCryptographicHash::hash(
+                parts.at(1).toUtf8(), QCryptographicHash::Sha256).toHex();
+
+            if (QString::fromLatin1(inputHash).compare(storedHash, Qt::CaseInsensitive) == 0) {
+                info.adminAuthenticated = true;
+                info.authenticated = true;
+                fails.clear();
+                SendToClient(currentSocket, "ADMIN_LOGIN_OK");
+                qDebug() << "🔐 Admin authenticated from IP:" << info.clientIp;
+            } else {
+                fails.append(nowMs2);
+                SendToClient(currentSocket, "ADMIN_LOGIN_FAILED");
+                qWarning() << "🚫 Failed admin login from IP:" << info.clientIp
+                           << "(attempts:" << fails.size() << ")";
+            }
+        }
+    }
+    // ✅ Защита: все остальные ADMIN_ команды требуют admin-аутентификации
+    else if (command.startsWith("ADMIN_") && !info.adminAuthenticated) {
+        qWarning() << "🚫 Unauthorized admin command attempt:" << command.left(50)
+                   << "from IP:" << info.clientIp;
+        SendToClient(currentSocket, "ADMIN_UNAUTHORIZED");
+        return;
+    }
+
     // ADMIN_GET_ALL_USERS
     else if (command == "ADMIN_GET_ALL_USERS") {
         QString jsonData;
@@ -2118,6 +2910,303 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         } else {
             SendToClient(currentSocket, "ADMIN_USERS_FAILED");
             qDebug() << "ADMIN_GET_ALL_USERS: FAILED";
+        }
+    }
+
+    // ✅ ADMIN_SET_FROZEN|user_id|0or1[|days]
+    //   frozen=1: лимит 2/год, по умолчанию 14 дней, авто-разморозка по таймеру.
+    //   frozen=0: ручная разморозка.
+    else if (command.startsWith("ADMIN_SET_FROZEN|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 3) {
+            int user_id = parts.at(1).toInt();
+            int frozen  = parts.at(2).toInt() ? 1 : 0;
+            int days    = parts.size() >= 4 ? parts.at(3).toInt() : 14;
+
+            bool ok = false;
+            QString errMsg;
+            if (frozen) {
+                ok = UserManagers.freezeSubscription(user_id, days, errMsg);
+            } else {
+                ok = UserManagers.unfreezeSubscription(user_id);
+            }
+            if (ok) {
+                SendToClient(currentSocket, QString("ADMIN_FROZEN_OK|%1|%2").arg(user_id).arg(frozen));
+                if (QTcpSocket* userSock = findSocketByUserId(user_id)) {
+                    SendToClient(userSock, QString("SUBSCRIPTION_FROZEN_CHANGED|%1").arg(frozen));
+                }
+            } else {
+                SendToClient(currentSocket, "ADMIN_FROZEN_FAILED|" + errMsg);
+            }
+        }
+    }
+    // ✅ ADMIN_BILLING_SAVE_METHOD|user_id|payment_method_id|payment_method_title|tier
+    //    Вызывается сайтом после первой успешной оплаты (webhook payment.succeeded).
+    //    Сохраняет сохранённую карту YooKassa и взводит next_billing_date = today+30д.
+    //    tier ∈ {'lite','feedback'} — VIP не авто-продлевается.
+    else if (command.startsWith("ADMIN_BILLING_SAVE_METHOD|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 5) {
+            int user_id            = parts.at(1).toInt();
+            QString paymentMethod  = parts.at(2);
+            QString methodTitle    = parts.at(3);
+            QString tier           = parts.at(4);
+            if (UserManagers.billingSaveMethod(user_id, paymentMethod, methodTitle, tier)) {
+                SendToClient(currentSocket,
+                             QString("ADMIN_BILLING_SAVE_OK|%1|%2").arg(user_id).arg(tier));
+                qDebug() << "ADMIN_BILLING_SAVE_METHOD: user=" << user_id << "tier=" << tier;
+            } else {
+                SendToClient(currentSocket, "ADMIN_BILLING_SAVE_FAILED");
+            }
+        } else {
+            SendToClient(currentSocket, "ADMIN_BILLING_SAVE_FAILED|BAD_FORMAT");
+        }
+    }
+    // ✅ ADMIN_BILLING_DUE — список пользователей, готовых к авто-списанию.
+    //    Возвращает JSON-массив [{user_id, tier, payment_method_id, retry_count}, ...]
+    //    Сайт-cron берёт его раз в день и для каждого делает YooKassa-платёж.
+    else if (command == "ADMIN_BILLING_DUE") {
+        QList<UserManager::BillingDueRow> rows;
+        if (UserManagers.billingGetDue(rows)) {
+            QJsonArray arr;
+            for (const auto &r : rows) {
+                QJsonObject o;
+                o["user_id"]           = r.userId;
+                o["tier"]              = r.tier;
+                o["payment_method_id"] = r.paymentMethodId;
+                o["retry_count"]       = r.retryCount;
+                o["email"]             = r.email;
+                o["first_name"]        = r.firstName;
+                arr.append(o);
+            }
+            QString json = QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+            SendToClient(currentSocket, "ADMIN_BILLING_DUE_DATA|" + json);
+        } else {
+            SendToClient(currentSocket, "ADMIN_BILLING_DUE_FAILED");
+        }
+    }
+    // ✅ ADMIN_BILLING_SUCCESS|user_id — пришла успешная YooKassa-транзакция.
+    //    Продлеваем подписку на 30 дней, сбрасываем retry, при необходимости размораживаем.
+    else if (command.startsWith("ADMIN_BILLING_SUCCESS|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 2) {
+            int user_id = parts.at(1).toInt();
+            // Узнаём, была ли подписка заморожена по биллингу — для уведомления клиента.
+            int wasFrozen = 0;
+            UserManagers.getSubscriptionFrozen(user_id, wasFrozen);
+
+            if (UserManagers.billingRecordSuccess(user_id)) {
+                SendToClient(currentSocket,
+                             QString("ADMIN_BILLING_SUCCESS_OK|%1").arg(user_id));
+                // Если юзер онлайн и размораживается — пушим обновление флага
+                if (wasFrozen) {
+                    if (QTcpSocket* userSock = findSocketByUserId(user_id)) {
+                        SendToClient(userSock, "SUBSCRIPTION_FROZEN_CHANGED|0");
+                    }
+                }
+            } else {
+                SendToClient(currentSocket, "ADMIN_BILLING_SUCCESS_FAILED");
+            }
+        }
+    }
+    // ✅ ADMIN_BILLING_FAILED|user_id — не удалось списать с карты.
+    //    Увеличиваем retry; на 3-й подряд неудаче — заморозка (freeze_reason='billing').
+    else if (command.startsWith("ADMIN_BILLING_FAILED|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 2) {
+            int user_id = parts.at(1).toInt();
+            bool nowFrozen = false;
+            if (UserManagers.billingRecordFailure(user_id, nowFrozen)) {
+                SendToClient(currentSocket,
+                             QString("ADMIN_BILLING_FAILED_OK|%1|%2")
+                                 .arg(user_id).arg(nowFrozen ? 1 : 0));
+                // Если только что заморозили — уведомим онлайн-клиент,
+                // чтобы NoSubscriptionScreen появился без перезахода в приложение.
+                if (nowFrozen) {
+                    if (QTcpSocket* userSock = findSocketByUserId(user_id)) {
+                        SendToClient(userSock, "SUBSCRIPTION_FROZEN_CHANGED|1");
+                    }
+                }
+            } else {
+                SendToClient(currentSocket, "ADMIN_BILLING_FAILED_FAILED");
+            }
+        }
+    }
+    // ✅ ADMIN_BILLING_CANCEL|user_id — пользователь отменил авто-продление в ЛК.
+    //    Сохранённая карта удаляется из биллинга (флаг auto_renew=0). Текущий тариф остаётся
+    //    активным до конца оплаченного периода (его сбросит админ или истёкший срок отдельно).
+    else if (command.startsWith("ADMIN_BILLING_CANCEL|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 2) {
+            int user_id = parts.at(1).toInt();
+            if (UserManagers.billingCancelAutoRenew(user_id)) {
+                SendToClient(currentSocket,
+                             QString("ADMIN_BILLING_CANCEL_OK|%1").arg(user_id));
+            } else {
+                SendToClient(currentSocket, "ADMIN_BILLING_CANCEL_FAILED");
+            }
+        }
+    }
+    // ✅ ADMIN_BILLING_GET|user_id — текущее состояние биллинга для страницы /account.
+    else if (command.startsWith("ADMIN_BILLING_GET|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 2) {
+            int user_id = parts.at(1).toInt();
+            QString json;
+            if (UserManagers.billingGetState(user_id, json)) {
+                SendToClient(currentSocket, "ADMIN_BILLING_STATE|" + json);
+            } else {
+                SendToClient(currentSocket, "ADMIN_BILLING_GET_FAILED");
+            }
+        }
+    }
+    // ✅ ADMIN_SET_FEEDBACK|user_id|0or1 — активация/снятие подписки "с обратной связью"
+    else if (command.startsWith("ADMIN_SET_FEEDBACK|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 3) {
+            int user_id = parts.at(1).toInt();
+            int status  = parts.at(2).toInt() ? 1 : 0;
+            if (UserManagers.setFeedbackSubscription(user_id, status)) {
+                SendToClient(currentSocket, QString("ADMIN_FEEDBACK_OK|%1|%2").arg(user_id).arg(status));
+                if (QTcpSocket* userSock = findSocketByUserId(user_id)) {
+                    SendToClient(userSock, QString("FEEDBACK_SUBSCRIPTION_CHANGED|%1").arg(status));
+                }
+            } else {
+                SendToClient(currentSocket, "ADMIN_FEEDBACK_FAILED");
+            }
+        }
+    }
+    // ✅ ADMIN_GET_CONVERSATIONS — список юзеров, у которых есть чат + непрочитанные
+    else if (command == "ADMIN_GET_CONVERSATIONS") {
+        QString jsonData;
+        if (UserManagers.getAdminConversations(jsonData))
+            SendToClient(currentSocket, "ADMIN_CONVERSATIONS_DATA|" + jsonData);
+        else
+            SendToClient(currentSocket, "ADMIN_CONVERSATIONS_FAILED");
+    }
+    // ✅ ADMIN_GET_CHAT|user_id — история переписки с конкретным юзером
+    else if (command.startsWith("ADMIN_GET_CHAT|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 2) {
+            int user_id = parts.at(1).toInt();
+            QString json;
+            if (UserManagers.loadChatHistory(user_id, json)) {
+                UserManagers.markChatRead(user_id, /*byAdmin=*/true);
+                SendToClient(currentSocket, QString("ADMIN_CHAT_DATA|%1|%2").arg(user_id).arg(json));
+            } else {
+                SendToClient(currentSocket, "ADMIN_CHAT_FAILED");
+            }
+        }
+    }
+    // ✅ ADMIN_SEND_MESSAGE|user_id|<base64-text>
+    else if (command.startsWith("ADMIN_SEND_MESSAGE|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 3) {
+            int user_id = parts.at(1).toInt();
+            QString text = QString::fromUtf8(QByteArray::fromBase64(parts.at(2).toLatin1()));
+            qint64 msgId = 0;
+            if (UserManagers.sendChatMessage(user_id, /*fromAdmin=*/true, text, msgId)) {
+                SendToClient(currentSocket, QString("ADMIN_MESSAGE_SENT|%1|%2").arg(user_id).arg(msgId));
+                // онлайн-получатель — пушим ему новое сообщение
+                if (QTcpSocket* userSock = findSocketByUserId(user_id)) {
+                    SendToClient(userSock, "CHAT_NEW_MESSAGE");
+                }
+            } else {
+                SendToClient(currentSocket, "ADMIN_MESSAGE_FAILED");
+            }
+        }
+    }
+    // ✅ ADMIN_CLEAR_CHAT|user_id — админ «закрывает диалог», стирая переписку
+    else if (command.startsWith("ADMIN_CLEAR_CHAT|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 2) {
+            int user_id = parts.at(1).toInt();
+            int deleted = 0;
+            if (UserManagers.clearChatHistory(user_id, deleted)) {
+                SendToClient(currentSocket,
+                             QString("ADMIN_CHAT_CLEARED|%1|%2").arg(user_id).arg(deleted));
+                // Если пользователь онлайн — уведомим, чтобы он перезагрузил чат.
+                if (QTcpSocket* userSock = findSocketByUserId(user_id)) {
+                    SendToClient(userSock, "CHAT_NEW_MESSAGE");
+                }
+            } else {
+                SendToClient(currentSocket, "ADMIN_CHAT_CLEAR_FAILED");
+            }
+        }
+    }
+    // ✅ ADMIN_SEND_CHAT_PHOTO|user_id|size + bytes — админ шлёт фото в чат
+    else if (command.startsWith("ADMIN_SEND_CHAT_PHOTO|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 3) {
+            int user_id = parts.at(1).toInt();
+            bool ok = false;
+            quint64 imgSize = parts.at(2).toULongLong(&ok);
+
+            if (!ok || imgSize == 0 || imgSize > MAX_IMAGE_SIZE) {
+                SendToClient(currentSocket, "BAD_COMMAND_FORMAT");
+                return;
+            }
+
+            QByteArray remainingData = currentSocket->readAll();
+            if (remainingData.size() >= (qint64)imgSize) {
+                QByteArray imageData = remainingData.left(imgSize);
+                qint64 msgId = 0;
+                if (UserManagers.sendChatPhoto(user_id, /*fromAdmin=*/true, imageData, msgId)) {
+                    SendToClient(currentSocket,
+                                 QString("ADMIN_CHAT_PHOTO_SENT|%1|%2").arg(user_id).arg(msgId));
+                    if (QTcpSocket* userSock = findSocketByUserId(user_id)) {
+                        SendToClient(userSock, "CHAT_NEW_MESSAGE");
+                    }
+                } else {
+                    SendToClient(currentSocket, "ADMIN_CHAT_PHOTO_FAILED");
+                }
+            } else {
+                // Фото придёт частями
+                info.imageBuffer.clear();
+                info.imageBuffer.append(remainingData);
+                info.expectedImageSize = imgSize;
+                info.imageUserId = user_id;
+                info.imageMeasurementId = -1;
+                info.imageRecipeId = -1;
+                info.imagePhotoType = "chat";
+                info.imageFromAdmin = true;
+                info.isReceivingImage = true;
+            }
+        } else {
+            SendToClient(currentSocket, "BAD_COMMAND_FORMAT");
+        }
+    }
+    // ✅ ADMIN_LIST_DEVICES|user_id — список push-устройств юзера
+    else if (command.startsWith("ADMIN_LIST_DEVICES|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 2) {
+            int user_id = parts.at(1).toInt();
+            QString json;
+            if (UserManagers.loadUserDevices(user_id, json))
+                SendToClient(currentSocket, "ADMIN_DEVICES_DATA|" + json);
+            else
+                SendToClient(currentSocket, "ADMIN_DEVICES_FAILED");
+        }
+    }
+    // ✅ ADMIN_PUSH_LIST_DEVICES — все устройства всех пользователей.
+    //    Используется сайтом-cron'ом для массовой рассылки push-уведомлений (ТЗ: 1-3 в день).
+    else if (command == "ADMIN_PUSH_LIST_DEVICES") {
+        QString json;
+        if (UserManagers.loadAllDevices(json))
+            SendToClient(currentSocket, "ADMIN_PUSH_DEVICES_DATA|" + json);
+        else
+            SendToClient(currentSocket, "ADMIN_PUSH_DEVICES_FAILED");
+    }
+    // ✅ ADMIN_PUSH_UNREGISTER|token — снять регистрацию устройства, когда FCM
+    //    вернул UNREGISTERED / NOT_FOUND (токен протух, переустановили приложение).
+    else if (command.startsWith("ADMIN_PUSH_UNREGISTER|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 2) {
+            QString token = parts.at(1);
+            if (UserManagers.removeDeviceByToken(token))
+                SendToClient(currentSocket, "ADMIN_PUSH_UNREGISTER_OK");
+            else
+                SendToClient(currentSocket, "ADMIN_PUSH_UNREGISTER_FAILED");
         }
     }
 
@@ -2429,6 +3518,58 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
             SendToClient(currentSocket, "ADMIN_GAMIFICATION_FAILED");
     }
 
+    // ADMIN_GET_ACHIEVEMENTS — загрузить все достижения с наградами
+    else if (command == "ADMIN_GET_ACHIEVEMENTS") {
+        QString jsonData;
+        if (UserManagers.getAllAchievements(jsonData))
+            SendToClient(currentSocket, "ADMIN_ACHIEVEMENTS_DATA|" + jsonData);
+        else
+            SendToClient(currentSocket, "ADMIN_ACHIEVEMENTS_FAILED");
+    }
+
+    // ADMIN_UPDATE_REWARD|achievement_id|new_reward
+    else if (command.startsWith("ADMIN_UPDATE_REWARD|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 3) {
+            int achId = parts.at(1).toInt();
+            int newReward = parts.at(2).toInt();
+            if (UserManagers.updateAchievementReward(achId, newReward)) {
+                QString jsonData;
+                UserManagers.getAllAchievements(jsonData);
+                SendToClient(currentSocket, "ADMIN_ACHIEVEMENTS_DATA|" + jsonData);
+                qDebug() << "ADMIN_UPDATE_REWARD OK: id=" << achId << "reward=" << newReward;
+            } else {
+                SendToClient(currentSocket, "ADMIN_ACHIEVEMENTS_FAILED");
+            }
+        }
+    }
+
+    // ADMIN_GET_BONUS_SETTINGS — список настраиваемых призовых баллов
+    else if (command == "ADMIN_GET_BONUS_SETTINGS") {
+        QString jsonData;
+        if (UserManagers.getAllBonusSettings(jsonData))
+            SendToClient(currentSocket, "ADMIN_BONUS_SETTINGS_DATA|" + jsonData);
+        else
+            SendToClient(currentSocket, "ADMIN_BONUS_SETTINGS_FAILED");
+    }
+
+    // ADMIN_SET_BONUS_SETTING|key|amount
+    else if (command.startsWith("ADMIN_SET_BONUS_SETTING|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 3) {
+            QString key = parts.at(1);
+            int amount = parts.at(2).toInt();
+            if (UserManagers.setBonusAmount(key, amount)) {
+                QString jsonData;
+                UserManagers.getAllBonusSettings(jsonData);
+                SendToClient(currentSocket, "ADMIN_BONUS_SETTINGS_DATA|" + jsonData);
+                qDebug() << "ADMIN_SET_BONUS_SETTING OK:" << key << "=" << amount;
+            } else {
+                SendToClient(currentSocket, "ADMIN_BONUS_SETTINGS_FAILED");
+            }
+        }
+    }
+
     // ==================== ДОСТИЖЕНИЯ И КАЧБАЛЛЫ ====================
 
     // GET_ACHIEVEMENTS|user_id → ACHIEVEMENTS_DATA|json
@@ -2510,6 +3651,114 @@ void Server::processCommand(QTcpSocket* currentSocket, const QString& command)
         }
     }
 
+    // ==================== VIP ПЕРСОНАЛЬНЫЕ ПРОГРАММЫ ====================
+
+    // ADMIN_SET_VIP|user_id|0or1
+    else if (command.startsWith("ADMIN_SET_VIP|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 3) {
+            int user_id = parts.at(1).toInt();
+            int status  = parts.at(2).toInt();
+            if (UserManagers.setVipSubscription(user_id, status)) {
+                SendToClient(currentSocket, QString("ADMIN_VIP_OK|%1|%2").arg(user_id).arg(status));
+                qDebug() << "ADMIN_SET_VIP: user=" << user_id << "status=" << status;
+            } else {
+                SendToClient(currentSocket, "ADMIN_VIP_FAILED");
+            }
+        }
+    }
+
+    // ADMIN_CREATE_VIP_PROGRAM|user_id|program_name_b64|workout1_b64|workout2_b64|workout3_b64
+    else if (command.startsWith("ADMIN_CREATE_VIP_PROGRAM|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 6) {
+            int user_id       = parts.at(1).toInt();
+            QString name      = QString::fromUtf8(QByteArray::fromBase64(parts.at(2).toLatin1()));
+            QString w1        = QString::fromUtf8(QByteArray::fromBase64(parts.at(3).toLatin1()));
+            QString w2        = QString::fromUtf8(QByteArray::fromBase64(parts.at(4).toLatin1()));
+            QString w3        = QString::fromUtf8(QByteArray::fromBase64(parts.at(5).toLatin1()));
+
+            if (UserManagers.createVipProgram(user_id, name, w1, w2, w3)) {
+                SendToClient(currentSocket, QString("ADMIN_VIP_PROGRAM_CREATED|%1").arg(user_id));
+                qDebug() << "ADMIN_CREATE_VIP_PROGRAM: user=" << user_id << "name=" << name;
+            } else {
+                SendToClient(currentSocket, "ADMIN_VIP_PROGRAM_CREATE_FAILED");
+            }
+        }
+    }
+
+    // ADMIN_LOAD_VIP_PROGRAM|user_id
+    else if (command.startsWith("ADMIN_LOAD_VIP_PROGRAM|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 2) {
+            int user_id = parts.at(1).toInt();
+            QString jsonData;
+            if (UserManagers.loadVipProgram(user_id, jsonData)) {
+                SendToClient(currentSocket, "ADMIN_VIP_PROGRAM_DATA|" + jsonData);
+            } else {
+                SendToClient(currentSocket, "ADMIN_VIP_PROGRAM_NONE");
+            }
+        }
+    }
+
+    // ADMIN_DELETE_VIP_PROGRAM|user_id
+    else if (command.startsWith("ADMIN_DELETE_VIP_PROGRAM|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 2) {
+            int user_id = parts.at(1).toInt();
+            if (UserManagers.deleteVipProgram(user_id)) {
+                SendToClient(currentSocket, QString("ADMIN_VIP_PROGRAM_DELETED|%1").arg(user_id));
+            } else {
+                SendToClient(currentSocket, "ADMIN_VIP_PROGRAM_DELETE_FAILED");
+            }
+        }
+    }
+
+    // LOAD_VIP_PROGRAM|user_id — клиент загружает свою VIP-программу
+    else if (command.startsWith("LOAD_VIP_PROGRAM|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 2) {
+            int user_id = parts.at(1).toInt();
+            QString jsonData;
+            if (UserManagers.loadVipProgram(user_id, jsonData)) {
+                SendToClient(currentSocket, "VIP_PROGRAM_DATA|" + jsonData);
+                qDebug() << "LOAD_VIP_PROGRAM: OK for user" << user_id;
+            } else {
+                SendToClient(currentSocket, "VIP_PROGRAM_NONE");
+            }
+        }
+    }
+
+    // SAVE_VIP_WEIGHT|user_id|exercise_name_b64|a1|a2|a3
+    else if (command.startsWith("SAVE_VIP_WEIGHT|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 6) {
+            int user_id    = parts.at(1).toInt();
+            QString exName = QString::fromUtf8(QByteArray::fromBase64(parts.at(2).toLatin1()));
+            float a1       = parts.at(3).toFloat();
+            float a2       = parts.at(4).toFloat();
+            float a3       = parts.at(5).toFloat();
+
+            if (UserManagers.saveVipExerciseWeight(user_id, exName, a1, a2, a3)) {
+                SendToClient(currentSocket, "SAVE_VIP_WEIGHT_OK");
+            } else {
+                SendToClient(currentSocket, "SAVE_VIP_WEIGHT_FAILED");
+            }
+        }
+    }
+
+    // LOAD_VIP_WEIGHT|user_id|exercise_name_b64
+    else if (command.startsWith("LOAD_VIP_WEIGHT|")) {
+        QStringList parts = command.split("|");
+        if (parts.size() >= 3) {
+            int user_id    = parts.at(1).toInt();
+            QString exName = QString::fromUtf8(QByteArray::fromBase64(parts.at(2).toLatin1()));
+            float a1 = 0, a2 = 0, a3 = 0;
+            UserManagers.loadVipExerciseWeight(user_id, exName, a1, a2, a3);
+            SendToClient(currentSocket, QString("LOAD_VIP_WEIGHT_OK|%1|%2|%3").arg(a1).arg(a2).arg(a3));
+        }
+    }
+
     else {
         qDebug() << "Unknown command:" << command.left(50);
     }
@@ -2542,18 +3791,53 @@ void Server::handleGetWorkoutProgress(QTcpSocket* currentSocket, const QString& 
             qDebug() << "⚙️ Auto-initialized plan_start_date for user" << user_id << ":" << now;
         }
 
-        // Сервер сам считает — прошло ли время (тест: 16 мин, реальный: 60 дней)
-        bool planChangeDue = false;
+        // ── Логика 60-дневного предложения смены плана и 90-дневного сброса ──
+        bool planChangeDue   = false;
+        bool planResetDue    = false;
+        bool vipUpdateNeeded = false;
         UserManagers.isPlanChangeDue(user_id, planChangeDue);
+        UserManagers.isPlanResetDue(user_id, planResetDue);
 
-        // Формат ответа: SUCCESS|week|w1|w2|w3|plan_completed|plan_change_due
-        QString resp = QString("GET_WORKOUT_PROGRESS_SUCCESS|%1|%2|%3|%4|%5|%6")
+        // Получаем VIP-статус — у VIP другая логика обновления планов
+        // (программу составляет тренер вручную через админку).
+        int vipSub = 0;
+        UserManagers.getVipSubscription(user_id, vipSub);
+        bool isVip = (vipSub == 1);
+
+        if (isVip) {
+            // VIP не получает обычное предложение смены плана.
+            // Если прошло >= 90 дней — показываем диалог «свяжитесь с тренером».
+            planChangeDue = false;
+            if (planResetDue) {
+                vipUpdateNeeded = true;
+            }
+            // VIP-программу автоматически НЕ сбрасываем — её обновляет тренер.
+            planResetDue = false;
+        } else if (planResetDue) {
+            // Lite/Plus, прошло >= 90 дней — авто-сброс плана и прогресса:
+            // переиспользуем adminResetUserPlan, который чистит PlanTrainning,
+            // прогресс по неделям и plan_start_date. После следующего входа
+            // пользователь сам выберет новый план.
+            UserManagers.adminResetUserPlan(user_id);
+            qDebug() << "♻️ 90-day plan reset triggered for user" << user_id;
+
+            // Перечитываем состояние, чтобы клиент увидел свежие нули.
+            UserManagers.getWorkoutProgress(user_id, current_week, w1, w2, w3,
+                                            d1, d2, d3, plan_completed);
+            planChangeDue = false;
+            planResetDue  = false;
+        }
+
+        // Формат: SUCCESS|week|w1|w2|w3|plan_completed|plan_change_due|vip_update_needed
+        // 7-е поле — новое; старые клиенты его игнорируют.
+        QString resp = QString("GET_WORKOUT_PROGRESS_SUCCESS|%1|%2|%3|%4|%5|%6|%7")
                            .arg(current_week)
                            .arg(w1 ? 1 : 0)
                            .arg(w2 ? 1 : 0)
                            .arg(w3 ? 1 : 0)
                            .arg(plan_completed ? 1 : 0)
-                           .arg(planChangeDue ? 1 : 0);
+                           .arg(planChangeDue ? 1 : 0)
+                           .arg(vipUpdateNeeded ? 1 : 0);
         SendToClient(currentSocket, resp);
         qDebug() << "✅ GET_WORKOUT_PROGRESS:" << resp;
     } else {
@@ -2574,7 +3858,8 @@ void Server::handleMarkWorkoutDone(QTcpSocket* currentSocket, const QString& com
     int workout_num = parts.at(2).toInt();
     QString date   = parts.at(3);
 
-    if (UserManagers.markWorkoutDone(user_id, workout_num, date)) {
+    int kachballsAwarded = 0;
+    if (UserManagers.markWorkoutDone(user_id, workout_num, date, kachballsAwarded)) {
         // Сохраняем снапшот статистики за текущую неделю
         UserManagers.computeAndSaveWeeklyStats(user_id);
 
@@ -2587,13 +3872,18 @@ void Server::handleMarkWorkoutDone(QTcpSocket* currentSocket, const QString& com
         bool planChangeDue = false;
         UserManagers.isPlanChangeDue(user_id, planChangeDue);
 
-        QString resp = QString("MARK_WORKOUT_DONE_SUCCESS|%1|%2|%3|%4|%5|%6")
+        int totalKachballs = 0;
+        UserManagers.getUserKachballs(user_id, totalKachballs);
+
+        QString resp = QString("MARK_WORKOUT_DONE_SUCCESS|%1|%2|%3|%4|%5|%6|%7|%8")
                            .arg(current_week)
                            .arg(w1 ? 1 : 0)
                            .arg(w2 ? 1 : 0)
                            .arg(w3 ? 1 : 0)
                            .arg(plan_completed ? 1 : 0)
-                           .arg(planChangeDue ? 1 : 0);
+                           .arg(planChangeDue ? 1 : 0)
+                           .arg(kachballsAwarded)
+                           .arg(totalKachballs);
         SendToClient(currentSocket, resp);
         qDebug() << "✅ MARK_WORKOUT_DONE:" << resp;
         // Автоматически проверяем новые достижения после тренировки
